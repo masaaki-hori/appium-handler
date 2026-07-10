@@ -1,86 +1,59 @@
-はい、承知しました。以下に、ご要望に基づいたQiita記事の下書きを作成いたします。
+# CLAUDE.md
 
----
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-# Appium Flutter Driverを改良し、Appium Inspectorを"automationName":"flutter"で動作するようにしてみた
+## What this is
 
-## はじめに
+`appium_handler` is a Dart/Flutter **package** (not an app) that gets embedded into a Flutter app under test. It is the app-side counterpart of a customized Appium Flutter Driver + Appium Inspector stack that makes Appium Inspector work against Flutter apps via `"automationName": "flutter"`. This repo is one of three cooperating repos in that project:
 
-モバイルアプリケーションのテスト自動化において、Flutterで開発されたアプリケーションのテストは特有の課題があります。本記事では、Appium Flutter Driverを改良し、Appium Inspectorを"automationName":"flutter"で動作させる方法について解説します。これにより、Flutterアプリケーションのテスト効率を大幅に向上させることができます。
+- `appium-flutter-driver` (customized) — forwards `getWindowRect`/`getPageSource`/`performActions`/`findElement` to the app-under-test via the `flutter:requestData` VM-service call (see `driver/lib/commands/screen.ts` and the `executeCommand` overrides in `driver/lib/driver.ts` for the counterpart on that side).
+- `appium-inspector` (customized) — GUI that renders the page source, hit-tests taps against it client-side (`utils/element-hit-testing.js`, parsing the same `bounds="[x1,y1][x2,y2]"` format `appium_handler.dart` emits), and records/generates test scripts. For a `flutter` session it always performs a coordinate-based tap (`actions/SessionInspector.js#tapFlutterWidgetAtCoordinates`) and reads back the `{foundBy, value}` the device resolved from the `performActions` response, then two Dart-specific code generators (`lib/client-frameworks/dart-integration-test.js`, `dart-patrol.js`, sharing `dart-common.js#getFlutterFinderExpression`) turn that into a `find.byXxx(...)` expression. This depends on exact string agreement with this package — see below.
+- `appium-handler` (this repo) — runs inside the test target app, receives commands, and answers them using Flutter's internal widget inspector APIs.
 
-## 背景
+**Protocol contract with the other two repos (verified compatible as of the last cross-check):** the `foundBy` values this package's `_driveFinder`/`_foundByFor` return (`byTooltip`, `bySemanticsLabel`, `byValueKey`, `byText`, `byType`) must exactly match the strings `dart-common.js#getFlutterFinderExpression`'s switch matches on in `appium-inspector`, since they round-trip through the `performActions` response (`{isError, response: {message: '<our _actionResult JSON>'}}`, per `flutter_driver`'s own `RequestDataResult`/`_requestData` wiring — nothing to change there, it's framework-internal) and are never re-validated at either end. `getFinderType`/`findByPosition` are implemented here but currently have **no caller** in either sibling repo — don't assume they're exercised by anything today. When touching finder-name strings in `_execCommandWithFinder`/`_driveFinder`/`_handleGetFinderType`, grep for the same literal in `appium-inspector`'s `dart-common.js` before renaming anything (a `'byToolTip'` vs `'byTooltip'` capitalization mismatch between `_handleGetFinderType` and `_execCommandWithFinder` was found and fixed here for exactly this reason).
 
-### Flutterとは
-Flutterは、Googleが開発したオープンソースのUIソフトウェア開発キットです。単一のコードベースからiOSとAndroid両方のプラットフォーム向けに高性能なネイティブアプリケーションを構築できます。
+The consuming app wires this package in with:
 
-### Appiumとは
-Appiumは、モバイルアプリケーション（ネイティブ、ハイブリッド、モバイルウェブ）のクロスプラットフォームテスト自動化ツールです。WebDriverプロトコルを使用し、様々なプログラミング言語でテストを記述できます。
+```dart
+import 'package:flutter_driver/driver_extension.dart';
+import 'package:appium_handler/appium_handler.dart';
 
-### Appium Driverについて
-Appium Driverは、特定のプラットフォームやテクノロジーに対応したAppiumの拡張機能です。Flutter Driverは、Flutterアプリケーションのテストに特化したドライバーです。
+void main() {
+  final handler = AppiumHandler();
+  enableFlutterDriverExtension(handler: handler.appiumHandler);
+  handler.buildDriverExtension();
+  runApp(const MyApp());
+}
+```
 
-### Appium Inspectorとは
-Appium Inspectorは、モバイルアプリケーションの要素を視覚的に検査し、インタラクトするためのGUIツールです。要素の特定やテストスクリプトの作成に役立ちます。
+Managed with FVM; pinned Flutter version is in [.fvmrc](.fvmrc) (currently 3.44.6 stable). Prefer `fvm flutter ...` over a bare `flutter` if `fvm` is installed, so the pinned SDK is used.
 
-## 改良点
+## Commands
 
-1. Appium-flutter-driverの手直し
-   - Flutter要素の識別機能の強化
-   - パフォーマンスの最適化
+- Install deps: `fvm flutter pub get`
+- Static analysis: `fvm flutter analyze` (uses `flutter_lints` via [analysis_options.yaml](analysis_options.yaml)) — should report no issues
+- Run tests: `fvm flutter test` — currently a small smoke test in [test/appium_handler_test.dart](test/appium_handler_test.dart) exercising the unknown-command fallback and `getScreenSize`
 
-2. Appium Inspectorの手直し
-   - Flutter固有の属性表示の追加
-   - ウィジェットツリーの可視化機能の実装
+`pubspec.yaml` intentionally only lists what `lib/` and `test/` actually import (`flutter`, `flutter_driver`, `flutter_test` as SDK deps, plus `xml`; `flutter_lints`/`test` as dev deps). Resist the urge to add packages "just in case" — a much larger, mostly-unused dependency list was previously the main reason `pub get` failed to resolve against newer Flutter SDKs.
 
-3. Appium Handlerの新規作成
-   - Flutterアプリケーションとの通信プロトコルの実装
-   - セッション管理の改善
+## Architecture
 
-## 使用方法
+Three files in `lib/` divide the work:
 
-1. 改良したAppium Flutter Driverのインストール
-   ```
-   npm install appium-flutter-driver@improved
-   ```
+- **`appium_handler.dart`** — `AppiumHandler`. This is the entry point invoked by the driver extension (passed as `handler:` to `enableFlutterDriverExtension`, which registers it as the `flutter:requestData` callback). Its `appiumHandler(String? cmd)` method is a switch over command names sent from the Appium Flutter Driver side:
+  - `getScreenSize` — returns logical screen size from `PlatformDispatcher`.
+  - `getPageSource` — walks the widget tree twice: `layoutTree()` first collects bounds (position/size) per widget via `AppiumWidgetInspectorService.getLayoutExplorerNode`, then `visitorTree()` builds an XML document (`_document`/`_source`) describing every widget with id, key, text, tooltip, semanticLabel, bounds, and center coordinates. This XML is what Appium Inspector's "App Source" view renders and what later commands query against.
+  - `getFinderType` / `findElement` / `findByPosition` — look up nodes in the cached `_document` by id, xpath, or screen coordinates, and decide *how* an element should be addressed. (As of the current `appium-flutter-driver` WIP, only `getPageSource`/`getWindowRect`/`performActions`/`findElement` have a driver-side caller; `getFinderType`/`findByPosition` are kept for completeness/future use.)
+  - `performActions` — decodes a W3C Actions-style JSON payload (`pointerMove`/`pointerDown`/`pointerUp`/`enterText`/`checkText`/`checkExistence`) and dispatches the resulting tap/scroll/enter_text/check command through `_execCommandWithFinder`.
 
-2. Appium Inspectorの設定
-   ```json
-   {
-     "platformName": "Android",
-     "deviceName": "emulator-5554",
-     "app": "/path/to/your/flutter/app.apk",
-     "automationName": "flutter"
-   }
-   ```
+  `_execCommandWithFinder` encodes the **finder priority order** used whenever an element must be addressed: tooltip → semantics label → value key → text → widget type (first match wins, falling back down the chain), delegating the actual command construction to the shared `_driveFinder`/`_driveKey` helpers, which call into `AppiumHandlerDriverExtension`.
 
-3. テストスクリプトの例
-   ```javascript
-   const driver = await wdio.remote(config);
-   const element = await driver.$('flutter:type=Text&text=Hello');
-   await element.click();
-   ```
+- **`widget_tree.dart`** — `AppiumWidgetInspectorService` (mixes in Flutter's own `WidgetInspectorService`). Exposes widget-tree/layout data that Flutter's public API doesn't surface directly: `getRootWidgetSummaryTreeWithPreviews` (full tree with text previews) and `getLayoutExplorerNode` (per-node render size + global position, pulled from `RenderBox`/`RenderView` internals). Its property-listing method is named `myGetProperties` (not `getProperties`) **on purpose** — `WidgetInspectorService` already defines a public `getProperties(String, String) -> String` (JSON-encoded) with an incompatible signature, so reusing that name is an invalid override. The whole file relies on `@visibleForTesting` framework internals (`InspectorSerializationDelegate`, `objectToDiagnosticsNode`), silenced file-wide via `ignore_for_file: invalid_use_of_visible_for_testing_member` since that's the entire point of this class.
 
-## 開発者が直面する可能性のある課題と解決策
+- **`appium_handler_extension.dart`** — `AppiumHandlerDriverExtension`, a copy of `flutter_driver`'s internal `_FlutterDriverExtension`, kept local (and public) so `appium_handler.dart` can hold a reference to it and call `.call(params)` directly once it has resolved a finder for a screen position — `enableFlutterDriverExtension()` doesn't expose its extension instance otherwise. When bumping the Flutter SDK version, diff this file against the current `_FlutterDriverExtension` in `packages/flutter_driver/lib/src/extension/extension.dart` inside the SDK — its method signatures (e.g. `deserializeFinder`/`deserializeCommand` gaining an optional `{String? path}` parameter between Flutter 3.24 and 3.44) are the most likely source of breakage on an SDK bump.
 
-1. **課題**: Flutter要素の動的な変化への対応
-   **解決策**: 待機戦略の改善と柔軟なセレクタの使用
+When modifying finder/command behavior, keep in mind the data flows one direction per call: driver command string → `appiumHandler` switch → (for page source) walk widget tree via `AppiumWidgetInspectorService` → cache as XML in `_document` → later commands resolve elements against that cached XML, not a live widget tree query.
 
-2. **課題**: クロスプラットフォームでの一貫性維持
-   **解決策**: プラットフォーム固有の条件分岐を最小限に抑え、共通のインターフェースを設計
+## Repo layout notes
 
-3. **課題**: パフォーマンスの最適化
-   **解決策**: 非同期処理の効率化とキャッシング機構の導入
-
-## まとめ
-
-Appium Flutter Driverを改良し、Appium Inspectorを"automationName":"flutter"で動作させることで、Flutterアプリケーションのテスト自動化プロセスを大幅に改善できました。この改良により、開発者はより直感的かつ効率的にFlutterアプリケーションのテストを作成し、実行することが可能になります。
-
-今後の課題としては、さらなるパフォーマンスの最適化や、より複雑なFlutterウィジェットへの対応が挙げられます。コミュニティからのフィードバックを積極的に取り入れ、継続的な改善を行っていく予定です。
-
-## 参考文献とリソース
-
-1. [Flutter公式ドキュメント](https://flutter.dev/docs)
-2. [Appium公式ドキュメント](https://appium.io/docs/en/about-appium/intro/)
-3. [Appium Flutter Driver GitHub リポジトリ](https://github.com/truongsinh/appium-flutter-driver)
-4. [WebdriverIO ドキュメント](https://webdriver.io/docs/api)
-5. [モバイルアプリケーションテスト自動化ベストプラクティス](https://www.ministryoftesting.com/dojo/lessons/mobile-test-automation-best-practices)
+The repo root also contains several near-duplicate long-form write-ups of this project as a Qiita article draft (`README.md`, `Qiita.md`, `ChatGPT.md`, `Gemini.md`, `perplexity.md`, `wrtn.md`, plus `images/`) — these are article drafts for publication, not architecture docs; don't treat divergences between them as bugs to reconcile.

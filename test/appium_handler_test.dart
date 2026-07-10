@@ -1,16 +1,20 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:appium_handler/appium_handler.dart';
-import 'package:appium_handler/widget_tree.dart';
 
 void main() {
-  final i = MyInspectorController();
-  i.computeTreeRoot();
+  testWidgets('unknown command returns an empty JSON object', (tester) async {
+    final handler = AppiumHandler();
+    expect(await handler.appiumHandler('notACommand'), jsonEncode({}));
+  });
 
-  test('adds one to input values', () {
-    final calculator = AppiumHandler();
-    expect(calculator.addOne(2), 3);
-    expect(calculator.addOne(-7), -6);
-    expect(calculator.addOne(0), 1);
+  testWidgets('getScreenSize returns the current view size', (tester) async {
+    final handler = AppiumHandler();
+    final response = await handler.appiumHandler('getScreenSize');
+    final decoded = jsonDecode(response) as Map<String, dynamic>;
+    expect(decoded['width'], isA<int>());
+    expect(decoded['height'], isA<int>());
   });
 }
