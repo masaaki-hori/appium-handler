@@ -389,47 +389,53 @@ class AppiumHandler {
           break;
         case 'enterText':
           final node = _getNodeFromOffset(Offset(x!.toDouble(), y!.toDouble()));
-          final result = await _execCommandWithFinder(
-            x,
-            y,
-            node!,
-            'enter_text',
-            enterText: action['text'],
-            foundBy: foundBy,
-            value: foundValue,
-          );
-          if (result != null && result['isError'] != true) {
-            return _actionResult(node, result);
+          if (node != null) {
+            final result = await _execCommandWithFinder(
+              x,
+              y,
+              node,
+              'enter_text',
+              enterText: action['text'],
+              foundBy: foundBy,
+              value: foundValue,
+            );
+            if (result != null && result['isError'] != true) {
+              return _actionResult(node, result);
+            }
           }
           break;
         case 'checkText':
           final node = _getNodeFromOffset(Offset(x!.toDouble(), y!.toDouble()));
-          final result = await _execCommandWithFinder(
-            x,
-            y,
-            node!,
-            'check_text',
-            enterText: action['text'],
-            foundBy: foundBy,
-            value: foundValue,
-          );
-          if (result != null && result['isError'] != true) {
-            return _actionResult(node, result);
+          if (node != null) {
+            final result = await _execCommandWithFinder(
+              x,
+              y,
+              node,
+              'check_text',
+              enterText: action['text'],
+              foundBy: foundBy,
+              value: foundValue,
+            );
+            if (result != null && result['isError'] != true) {
+              return _actionResult(node, result);
+            }
           }
           break;
         case 'checkExistence':
           final node = _getNodeFromOffset(Offset(x!.toDouble(), y!.toDouble()));
-          final result = await _execCommandWithFinder(
-            x,
-            y,
-            node!,
-            'check_existence',
-            enterText: '',
-            foundBy: foundBy,
-            value: foundValue,
-          );
-          if (result != null && result['isError'] != true) {
-            return _actionResult(node, result);
+          if (node != null) {
+            final result = await _execCommandWithFinder(
+              x,
+              y,
+              node,
+              'check_existence',
+              enterText: '',
+              foundBy: foundBy,
+              value: foundValue,
+            );
+            if (result != null && result['isError'] != true) {
+              return _actionResult(node, result);
+            }
           }
           break;
       }
