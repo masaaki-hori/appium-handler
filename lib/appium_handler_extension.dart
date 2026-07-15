@@ -2,8 +2,102 @@ import 'dart:async';
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter_driver/driver_extension.dart';
-import 'package:flutter_driver/flutter_driver.dart';
+import 'package:flutter_driver/flutter_driver.dart' hide find;
 import 'package:flutter_test/flutter_test.dart';
+
+import 'widget_tree.dart';
+
+/// A `ByType` finder narrowed to the Nth widget (in element-tree evaluation order) with that
+/// runtime type, for when plain `ByType` is ambiguous (matches more than one widget - the common
+/// case for types like `Icon`/`Text`/`Container`, which flutter_test's own `ByType` finder can't
+/// resolve to a single target on its own).
+class ByTypeIndexFinder extends SerializableFinder {
+  const ByTypeIndexFinder(this.type, this.index);
+
+  final String type;
+  final int index;
+
+  @override
+  String get finderType => 'ByTypeIndex';
+
+  @override
+  Map<String, String> serialize() =>
+      super.serialize()..addAll({'type': type, 'index': index.toString()});
+}
+
+class ByTypeIndexFinderExtension extends FinderExtension {
+  @override
+  String get finderType => 'ByTypeIndex';
+
+  @override
+  SerializableFinder deserialize(
+    Map<String, String> params,
+    DeserializeFinderFactory finderFactory,
+  ) {
+    return ByTypeIndexFinder(params['type']!, int.parse(params['index']!));
+  }
+
+  @override
+  Finder createFinder(SerializableFinder finder, CreateFinderFactory finderFactory) {
+    final byTypeIndex = finder as ByTypeIndexFinder;
+    return find
+        .byElementPredicate(
+          (element) => element.widget.runtimeType.toString() == byTypeIndex.type,
+          description:
+              'widget with runtimeType "${byTypeIndex.type}" at index ${byTypeIndex.index}',
+        )
+        .at(byTypeIndex.index);
+  }
+}
+
+/// Resolves a widget by the same `id` `appium_handler.dart` already puts on every page-source
+/// XML node (a `WidgetInspectorService` diagnostics-reference id), rather than by any observable
+/// property of the widget - unambiguous by construction, unlike `ByTooltipMessage`/
+/// `BySemanticsLabel`/`ByValueKey`/`ByText`/`ByType`, which can all be missing or match more than
+/// one widget. Only meaningful for driving the *live* Inspector session: there's no `find.byId`
+/// in real flutter_test, so this can't be emitted into generated test code, unlike the others.
+class ByIdFinder extends SerializableFinder {
+  const ByIdFinder(this.id);
+
+  final String id;
+
+  @override
+  String get finderType => 'ById';
+
+  @override
+  Map<String, String> serialize() => super.serialize()..addAll({'id': id});
+}
+
+class ByIdFinderExtension extends FinderExtension {
+  ByIdFinderExtension(this._getInspectorService);
+
+  // A getter rather than a fixed instance: `appium_handler.dart` replaces its
+  // `AppiumWidgetInspectorService` every `getPageSource` call, and only *that* instance's own id
+  // registry (`toObject`) can resolve the ids it minted.
+  final AppiumWidgetInspectorService? Function() _getInspectorService;
+
+  @override
+  String get finderType => 'ById';
+
+  @override
+  SerializableFinder deserialize(
+    Map<String, String> params,
+    DeserializeFinderFactory finderFactory,
+  ) {
+    return ByIdFinder(params['id']!);
+  }
+
+  @override
+  Finder createFinder(SerializableFinder finder, CreateFinderFactory finderFactory) {
+    final byId = finder as ByIdFinder;
+    // ignore: invalid_use_of_protected_member
+    final object = _getInspectorService()?.toObject(byId.id);
+    return find.byElementPredicate(
+      (element) => identical(element, object),
+      description: 'widget with page-source id "${byId.id}"',
+    );
+  }
+}
 
 // A copy of flutter_driver's internal `_FlutterDriverExtension`, exposed as a public class so
 // `AppiumHandler` (appium_handler.dart) can hold a reference to it and call `.call(params)`

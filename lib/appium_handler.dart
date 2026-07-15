@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ui';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:xml/xml.dart';
 
 import 'appium_handler_extension.dart';
@@ -29,13 +32,26 @@ class AppiumHandler {
   AppiumHandlerDriverExtension? _driverExtension;
   final Map<String, List<Offset>> _treeItemOffsets = {};
 
+  // Kept as an instance field (not a local variable in `_getPageSource`) so `ByIdFinderExtension`
+  // can resolve a page-source `id` back to the exact widget it came from via `toObject(id)`,
+  // which is only valid for the same `WidgetInspectorService` instance that minted that id -
+  // `_idToReferenceData` (the id registry `toObject` reads) is an instance field of the mixin,
+  // not shared/static across instances.
+  AppiumWidgetInspectorService? _inspectorService;
+
   void buildDriverExtension() {
-    _driverExtension = AppiumHandlerDriverExtension(appiumHandler, true, false);
+    _driverExtension = AppiumHandlerDriverExtension(
+      appiumHandler,
+      true,
+      false,
+      finders: [ByTypeIndexFinderExtension(), ByIdFinderExtension(() => _inspectorService)],
+    );
   }
 
   Future<String> appiumHandler(String? cmd) async {
     final cmdAndArg = cmd?.split(':');
     final msg = cmdAndArg?[0];
+    debugPrint('[appium_handler] Received command: $msg');
     switch (msg) {
       case 'getScreenSize':
         return _getScreenSize();
@@ -68,120 +84,152 @@ class AppiumHandler {
   /// (see widget_tree.dart), attaching a global pixel `bounds` rect to each node so that
   /// `_getNodeFromOffset` can later resolve a screen coordinate back to a widget.
   String _getPageSource() {
-    final tree = AppiumWidgetInspectorService();
+    try {
+      _inspectorService = AppiumWidgetInspectorService();
+      final tree = _inspectorService!;
 
-    void layoutTree(Map<String, dynamic>? element) {
-      final valueId = element?['valueId'];
+      // Computes and caches this node's bounds in `_treeItemOffsets`. Failures here are
+      // per-widget (e.g. a widget with no RenderBox/layout data yet) - logged and skipped
+      // rather than aborting the whole tree, so one problematic widget doesn't take down
+      // page source retrieval for the entire app. Recursion into children always happens,
+      // even if this node's own bounds lookup failed.
+      void layoutTree(Map<String, dynamic>? element) {
+        final valueId = element?['valueId'];
+        try {
+          // subtreeDepth: 0 - only this node's own size/parentData is read below; its children
+          // are covered by this same function's own recursion, not by this call's descendants.
+          // A larger depth here would make every one of these per-node calls re-serialize that
+          // node's entire subtree, redundant with (and far more expensive than) the recursion.
+          final layout = tree.getLayoutExplorerNode({
+            'id': valueId,
+            'subtreeDepth': '0',
+            'groupName': 'tree_1',
+          });
+          final Map<String, dynamic> result =
+              layout['result'] as Map<String, dynamic>;
+          final Map<String, dynamic> size = result['size'];
+          final width = double.parse(size['width']);
+          final height = double.parse(size['height']);
+          double left = 0.0;
+          double top = 0.0;
+          if (result['parentData'] != null) {
+            final Map<String, dynamic> parentData = result['parentData'];
+            left = double.parse(parentData['globalX']);
+            top = double.parse(parentData['globalY']);
+          }
 
-      double left = 0.0;
-      double top = 0.0;
-      double width = 0.0;
-      double height = 0.0;
+          final topLeft = Offset(left, top);
+          final bottomRight = Offset(left + width, top + height);
+          _treeItemOffsets[valueId] = [topLeft, bottomRight];
+        } catch (e, stackTrace) {
+          debugPrint(
+            '[appium_handler] layoutTree failed for widget $valueId: $e\n$stackTrace',
+          );
+        }
 
-      final layout = tree.getLayoutExplorerNode({
-        'id': valueId,
-        'subtreeDepth': '100000',
+        // 'hasChildren' is absent (null), rather than false, on some leaf widgets - treat
+        // that the same as 'no children' instead of letting the cast throw
+        if ((element?['hasChildren'] as bool?) ?? false) {
+          for (final child in element?['children']) {
+            layoutTree(child);
+          }
+        }
+      }
+
+      // Appends this node's XML element (and recurses into its children) to `_source`.
+      // Same per-widget resilience as `layoutTree`: a failure while reading this node's own
+      // properties still emits a (minimal) element with matching open/close tags, so the XML
+      // stays well-formed and the rest of the tree (siblings, children) is unaffected.
+      void visitorTree(Map<String, dynamic>? element) {
+        final valueId = element?['valueId'];
+        var type = 'Unknown';
+        try {
+          final String runtimeType = element?['widgetRuntimeType'];
+          type = runtimeType.replaceAll('<', '-').replaceAll('>', '-');
+
+          final properties = tree.myGetProperties(valueId, 'tree_1');
+          String? key;
+          String? text;
+          String? enabled;
+          String? toolTip;
+          String? semanticLabel;
+          for (final property in properties as List<dynamic>) {
+            final description = (property['description'] as String?)
+                ?.replaceAll('"', '');
+            final value = (description == 'null') ? '' : description;
+            switch (property['name']) {
+              case 'key':
+                key = value;
+              case 'data':
+                text = value;
+              case 'enabled':
+                enabled = value;
+              case 'tooltip':
+                toolTip = value;
+              case 'semanticLabel':
+                semanticLabel = value;
+              case 'controller':
+                final txt = property['description'] as String;
+                final start = txt.indexOf('┤');
+                final end = txt.indexOf('├');
+                if (start > 0 && end > 0) {
+                  text = txt.substring(start + 1, end);
+                }
+            }
+          }
+
+          final isEditable =
+              runtimeType == 'TextField' || runtimeType == 'TextFormField';
+
+          var topLeft = const Offset(0.0, 0.0);
+          var bottomRight = const Offset(0.0, 0.0);
+          final listOffset = _treeItemOffsets[valueId];
+          if (listOffset != null) {
+            topLeft = listOffset[0];
+            bottomRight = listOffset[1];
+          }
+
+          ++_index;
+          _source +=
+              '<$type id="$valueId" key="$key" index="$_index" class="$type" '
+              'text="${text ?? ''}" tooltip="${toolTip ?? ''}" '
+              'bounds="[${topLeft.dx.toInt()},${topLeft.dy.toInt()}]'
+              '[${bottomRight.dx.toInt()},${bottomRight.dy.toInt()}]" '
+              'enabled="${enabled ?? ''}" semanticLabel="${semanticLabel ?? ''}" '
+              'input="${isEditable ? 'true' : 'false'}" '
+              'centerX="${((topLeft.dx + bottomRight.dx) / 2).toInt()}" '
+              'centerY="${((topLeft.dy + bottomRight.dy) / 2).toInt()}">\n';
+        } catch (e, stackTrace) {
+          debugPrint(
+            '[appium_handler] visitorTree failed for widget $valueId ($type): $e\n$stackTrace',
+          );
+          ++_index;
+          _source += '<$type id="$valueId" index="$_index" class="$type">\n';
+        }
+
+        // Same null-safety as 'layoutTree' above
+        if ((element?['hasChildren'] as bool?) ?? false) {
+          for (final child in element?['children']) {
+            visitorTree(child);
+          }
+        }
+        _source += '</$type>\n';
+      }
+
+      _source = '<?xml version="1.0"?>\n<tree>\n';
+      final result = tree.getRootWidgetSummaryTreeWithPreviews({
         'groupName': 'tree_1',
       });
-      final Map<String, dynamic> result =
-          layout['result'] as Map<String, dynamic>;
-      final Map<String, dynamic> size = result['size'];
-      width = double.parse(size['width']);
-      height = double.parse(size['height']);
-      if (result['parentData'] != null) {
-        final Map<String, dynamic> parentData = result['parentData'];
-        left = double.parse(parentData['globalX']);
-        top = double.parse(parentData['globalY']);
-      }
+      layoutTree(result['result'] as Map<String, dynamic>?);
+      visitorTree(result['result'] as Map<String, dynamic>?);
+      _source += '</tree>\n';
 
-      final topLeft = Offset(left, top);
-      final bottomRight = Offset(left + width, top + height);
-      _treeItemOffsets[valueId] = [topLeft, bottomRight];
-
-      if (element?['hasChildren'] as bool) {
-        for (final child in element?['children']) {
-          layoutTree(child);
-        }
-      }
+      _document = XmlDocument.parse(_source);
+      return _document.toString();
+    } catch (e, stackTrace) {
+      debugPrint('[appium_handler] _getPageSource failed: $e\n$stackTrace');
+      rethrow;
     }
-
-    void visitorTree(Map<String, dynamic>? element) {
-      final String runtimeType = element?['widgetRuntimeType'];
-      final type = runtimeType.replaceAll('<', '-').replaceAll('>', '-');
-      final valueId = element?['valueId'];
-
-      final properties = tree.myGetProperties(valueId, 'tree_1');
-      String? key;
-      String? text;
-      String? enabled;
-      String? toolTip;
-      String? semanticLabel;
-      for (final property in properties as List<dynamic>) {
-        final description = (property['description'] as String?)?.replaceAll(
-          '"',
-          '',
-        );
-        final value = (description == 'null') ? '' : description;
-        switch (property['name']) {
-          case 'key':
-            key = value;
-          case 'data':
-            text = value;
-          case 'enabled':
-            enabled = value;
-          case 'tooltip':
-            toolTip = value;
-          case 'semanticLabel':
-            semanticLabel = value;
-          case 'controller':
-            final txt = property['description'] as String;
-            final start = txt.indexOf('┤');
-            final end = txt.indexOf('├');
-            if (start > 0 && end > 0) {
-              text = txt.substring(start + 1, end);
-            }
-        }
-      }
-
-      final isEditable =
-          runtimeType == 'TextField' || runtimeType == 'TextFormField';
-
-      var topLeft = const Offset(0.0, 0.0);
-      var bottomRight = const Offset(0.0, 0.0);
-      final listOffset = _treeItemOffsets[valueId];
-      if (listOffset != null) {
-        topLeft = listOffset[0];
-        bottomRight = listOffset[1];
-      }
-
-      ++_index;
-      _source +=
-          '<$type id="$valueId" key="$key" index="$_index" class="$type" '
-          'text="${text ?? ''}" tooltip="${toolTip ?? ''}" '
-          'bounds="[${topLeft.dx.toInt()},${topLeft.dy.toInt()}]'
-          '[${bottomRight.dx.toInt()},${bottomRight.dy.toInt()}]" '
-          'enabled="${enabled ?? ''}" semanticLabel="${semanticLabel ?? ''}" '
-          'input="${isEditable ? 'true' : 'false'}" '
-          'centerX="${((topLeft.dx + bottomRight.dx) / 2).toInt()}" '
-          'centerY="${((topLeft.dy + bottomRight.dy) / 2).toInt()}">\n';
-      if (element?['hasChildren'] as bool) {
-        for (final child in element?['children']) {
-          visitorTree(child);
-        }
-      }
-      _source += '</$type>\n';
-    }
-
-    _source = '<?xml version="1.0"?>\n<tree>\n';
-    final result = tree.getRootWidgetSummaryTreeWithPreviews({
-      'groupName': 'tree_1',
-    });
-    layoutTree(result['result'] as Map<String, dynamic>?);
-    visitorTree(result['result'] as Map<String, dynamic>?);
-    _source += '</tree>\n';
-
-    _document = XmlDocument.parse(_source);
-    return _document.toString();
   }
 
   Future<String> _handlePerformActions(String cmd) async {
@@ -388,7 +436,7 @@ class AppiumHandler {
           }
           break;
         case 'enterText':
-          final node = _getNodeFromOffset(Offset(x!.toDouble(), y!.toDouble()));
+          final node = _resolveNode(x!, y!, action['elementId'] as String?);
           if (node != null) {
             final result = await _execCommandWithFinder(
               x,
@@ -405,7 +453,7 @@ class AppiumHandler {
           }
           break;
         case 'checkText':
-          final node = _getNodeFromOffset(Offset(x!.toDouble(), y!.toDouble()));
+          final node = _resolveNode(x!, y!, action['elementId'] as String?);
           if (node != null) {
             final result = await _execCommandWithFinder(
               x,
@@ -422,7 +470,7 @@ class AppiumHandler {
           }
           break;
         case 'checkExistence':
-          final node = _getNodeFromOffset(Offset(x!.toDouble(), y!.toDouble()));
+          final node = _resolveNode(x!, y!, action['elementId'] as String?);
           if (node != null) {
             final result = await _execCommandWithFinder(
               x,
@@ -444,11 +492,152 @@ class AppiumHandler {
   }
 
   String _actionResult(XmlNode node, Map<String, dynamic> result) {
+    // 'submitted' is only ever set (by _submitTextEntry's callers) for a successful enter_text -
+    // appium-inspector uses it to decide whether the generated code also needs a
+    // TextInputAction.done step after entering the text, matching what actually happened live.
     return '{"text":"${node.getAttribute('text')}","elementId":"${node.getAttribute('id')}",'
-        '"type":"${node.getAttribute('class')}","foundBy":"${result['foundBy']}","value":"${result['value']}"}';
+        '"type":"${node.getAttribute('class')}","foundBy":"${result['foundBy']}","value":"${result['value']}",'
+        '"submitted":${result['submitted'] == true}}';
   }
 
   Future<Map<String, dynamic>?> _execCommandWithFinder(
+    int x,
+    int y,
+    XmlNode node,
+    String command, {
+    String? enterText,
+    int? duration,
+    int? dx,
+    int? dy,
+    String? foundBy,
+    String? value,
+  }) async {
+    if (command == 'check_text' || command == 'check_existence') {
+      final locator = await _computeRecordableLocator(node, foundBy: foundBy, value: value);
+      return {'isError': false, 'foundBy': locator.foundBy, 'value': locator.value};
+    }
+
+    // Resolving by the widget's own page-source id is unambiguous by construction, unlike
+    // tooltip/semanticsLabel/key/text/type below (any of which can be missing, or match more
+    // than one widget) - so it's tried first for actually performing the action. It's not usable
+    // as a *recorded* locator though (there's no `find.byId` in real flutter_test outside our own
+    // `ByIdFinderExtension`), so the recordable foundBy/value is still computed independently of
+    // how the action actually got performed.
+    final id = node.getAttribute('id');
+    if (id != null && id.isNotEmpty) {
+      final result = await _driveById(
+        command,
+        id,
+        enterText: enterText,
+        duration: duration,
+        dx: dx,
+        dy: dy,
+      );
+      if (result != null && result['isError'] != true) {
+        final locator = await _computeRecordableLocator(node, foundBy: foundBy, value: value);
+        result['foundBy'] = locator.foundBy;
+        result['value'] = locator.value;
+        return result;
+      }
+    }
+
+    // Only reached if resolving/acting by id somehow failed - e.g. the
+    // `AppiumWidgetInspectorService` that minted this id has since been replaced by a newer
+    // `getPageSource` call.
+    return _execCommandWithFinderChain(
+      x,
+      y,
+      node,
+      command,
+      enterText: enterText,
+      duration: duration,
+      dx: dx,
+      dy: dy,
+      foundBy: foundBy,
+      value: value,
+    );
+  }
+
+  Future<Map<String, dynamic>?> _driveById(
+    String command,
+    String id, {
+    String? enterText,
+    int? duration,
+    int? dx,
+    int? dy,
+  }) async {
+    if (command == 'enter_text') {
+      await _focusForTextEntry({'finderType': 'ById', 'id': id});
+    }
+    final params = <String, String>{'command': command, 'finderType': 'ById', 'id': id};
+    if (dx != null && dy != null) {
+      params['dx'] = dx.toString();
+      params['dy'] = dy.toString();
+    }
+    if (duration != null) {
+      params['duration'] = duration.toString();
+    }
+    if (command == 'scroll') {
+      params['frequency'] = '60';
+    }
+    if (command == 'enter_text') {
+      params['text'] = enterText!;
+    }
+    final result = await _callDriverExtension(params);
+    if (command == 'enter_text' && result != null && result['isError'] != true) {
+      await _submitTextEntry();
+      result['submitted'] = true;
+    }
+    return result;
+  }
+
+  /// Determines the `foundBy`/`value` that should be *reported* for [node] - i.e. what a
+  /// generated test's `find.byXxx(...)` locator should use - independent of whichever finder
+  /// actually performed the action (see `_execCommandWithFinder`'s `ById` attempt above this).
+  /// Same tooltip -> semantics label -> value key -> text -> widget type priority as
+  /// `_execCommandWithFinderChain` below, minus the actual driving.
+  Future<({String foundBy, String value})> _computeRecordableLocator(
+    XmlNode node, {
+    String? foundBy,
+    String? value,
+  }) async {
+    if (foundBy == 'byTooltip') {
+      return (foundBy: 'byTooltip', value: value!);
+    }
+    final tooltip = await _findNodeTooltip(node);
+    if (tooltip != null && tooltip.isNotEmpty) {
+      return (foundBy: 'byTooltip', value: tooltip);
+    }
+    if (foundBy == 'bySemanticsLabel') {
+      return (foundBy: 'bySemanticsLabel', value: value!);
+    }
+    final semanticLabel = await _findNodeLabel(node);
+    if (semanticLabel != null && semanticLabel.isNotEmpty) {
+      return (foundBy: 'bySemanticsLabel', value: semanticLabel);
+    }
+    if (foundBy == 'byValueKey') {
+      return (foundBy: 'byValueKey', value: value!);
+    }
+    final key = node.getAttribute('key');
+    if (key != null && key.isNotEmpty) {
+      return (foundBy: 'byValueKey', value: key);
+    }
+    if (foundBy == 'byText') {
+      return (foundBy: 'byText', value: value!);
+    }
+    final text = await _findNodeText(node);
+    if (text != null && text.isNotEmpty) {
+      return (foundBy: 'byText', value: text);
+    }
+    final type = foundBy == 'byType' ? value! : node.getAttribute('class')!;
+    final index = _typeIndexOf(node, type);
+    return (foundBy: 'byType', value: index != null ? '$type#$index' : type);
+  }
+
+  /// The tooltip -> semantics label -> value key -> text -> widget type fallback chain, used to
+  /// both drive the action *and* determine the reported locator, when acting by page-source id
+  /// (see `_execCommandWithFinder` above) isn't available or didn't work.
+  Future<Map<String, dynamic>?> _execCommandWithFinderChain(
     int x,
     int y,
     XmlNode node,
@@ -557,7 +746,7 @@ class AppiumHandler {
       );
     }
     final type = foundBy == 'byType' ? value! : node.getAttribute('class')!;
-    return _driveFinder(
+    final result = await _driveFinder(
       command,
       'ByType',
       'type',
@@ -567,6 +756,151 @@ class AppiumHandler {
       dx: dx,
       dy: dy,
     );
+    if (result != null && result['isError'] != true) {
+      return result;
+    }
+    if (command != 'tap' && command != 'scroll') {
+      return result;
+    }
+    // A widget type is rarely unique in a real app (any Icon/Text/Container/etc. commonly has
+    // many instances), so plain `ByType` typically fails here with a "Found N widgets" ambiguity
+    // from flutter_test. Retry narrowed to this node's position among same-typed nodes in the
+    // last-fetched page source - a valid, replayable locator (`find.byType(X).at(N)`) as long as
+    // the element tree's evaluation order doesn't change between now and when a generated test
+    // using it runs.
+    final index = _typeIndexOf(node, type);
+    if (index != null) {
+      final indexedResult = await _driveByTypeIndex(
+        command,
+        type,
+        index,
+        duration: duration,
+        dx: dx,
+        dy: dy,
+      );
+      if (indexedResult != null && indexedResult['isError'] != true) {
+        return indexedResult;
+      }
+    }
+    // Last resort: synthesize the gesture directly at the tapped coordinate, bypassing finder
+    // resolution entirely. Deliberately reports no foundBy/value, since neither `ByType` nor
+    // `ByTypeIndex` proved reliable for this widget.
+    return _driveByCoordinate(command, x, y, dx: dx, dy: dy);
+  }
+
+  /// The 0-based position of [node] among all `_document` nodes sharing its `class` attribute, in
+  /// document order - the same order `find.byElementPredicate` (which `ByType`/`ByTypeIndex` are
+  /// both built on) visits elements in, so it lines up with `Finder.at(index)`.
+  int? _typeIndexOf(XmlNode node, String type) {
+    var index = 0;
+    for (final candidate in _document?.descendants ?? const <XmlNode>[]) {
+      if (candidate.getAttribute('class') != type) {
+        continue;
+      }
+      if (identical(candidate, node)) {
+        return index;
+      }
+      index++;
+    }
+    return null;
+  }
+
+  Future<Map<String, dynamic>?> _driveByTypeIndex(
+    String command,
+    String type,
+    int index, {
+    int? duration,
+    int? dx,
+    int? dy,
+  }) async {
+    final params = <String, String>{
+      'command': command,
+      'finderType': 'ByTypeIndex',
+      'type': type,
+      'index': index.toString(),
+    };
+    if (dx != null && dy != null) {
+      params['dx'] = dx.toString();
+      params['dy'] = dy.toString();
+    }
+    if (duration != null) {
+      params['duration'] = duration.toString();
+    }
+    if (command == 'scroll') {
+      params['frequency'] = '60';
+    }
+    final result = await _callDriverExtension(params);
+    if (result != null && result['isError'] != true) {
+      result['foundBy'] = 'byType';
+      result['value'] = '$type#$index';
+    }
+    return result;
+  }
+
+  /// How long to wait for a single finder-based command before giving up on it and letting the
+  /// caller's fallback chain (ByType -> ByTypeIndex -> raw coordinate) move on to the next tier.
+  static const _driverCallTimeout = Duration(seconds: 2);
+
+  /// Sends [params] through [_driverExtension], working around two ways a `flutter_driver`
+  /// finder-based command (tap/scroll/enter_text) can hang indefinitely instead of ever
+  /// completing, both from `CommandHandlerFactory.waitForElement`:
+  ///
+  /// 1. It waits for `SchedulerBinding.transientCallbackCount` to reach zero before (and after)
+  ///    acting, *if* frame sync is enabled. A widget with a repeating animation (a loading
+  ///    spinner, a shimmer effect) keeps registering new transient ticker callbacks forever, so
+  ///    that count never reaches zero. Worked around by disabling frame sync (`set_frame_sync`,
+  ///    already implemented by the framework's own `CommandHandlerFactory`) for just this one
+  ///    call when a transient callback is currently pending, restoring it immediately after -
+  ///    unrelated interactions on non-animating screens keep the normal, safer waiting behavior.
+  /// 2. Regardless of frame sync, it *always* waits for the finder itself to evaluate to a
+  ///    non-empty result. If the target widget is never considered hit-testable while this is
+  ///    polled (e.g. it's part of a continuously-rebuilding animation), this wait alone can hang
+  ///    forever - `set_frame_sync` has no effect on it. Worked around with our own timeout: Dart
+  ///    can't cancel the original call, so it keeps polling harmlessly in the background, but we
+  ///    stop waiting on it and report failure so the caller can fall back instead of hanging.
+  Future<Map<String, dynamic>?> _callDriverExtension(Map<String, String> params) async {
+    final needsFrameSyncOverride = SchedulerBinding.instance.transientCallbackCount > 0;
+    if (needsFrameSyncOverride) {
+      await _driverExtension?.call({'command': 'set_frame_sync', 'enabled': 'false'});
+    }
+    try {
+      return await _driverExtension?.call(params).timeout(_driverCallTimeout);
+    } on TimeoutException {
+      return {'isError': true, 'response': 'timed out waiting for the finder to resolve'};
+    } finally {
+      if (needsFrameSyncOverride) {
+        await _driverExtension?.call({'command': 'set_frame_sync', 'enabled': 'true'});
+      }
+    }
+  }
+
+  /// Synthesizes a tap/scroll gesture directly at a screen coordinate via the widget-testing
+  /// `WidgetController` (bypassing flutter_driver's finder resolution entirely), for when no
+  /// finder-based locator can reliably target the widget under that point.
+  Future<Map<String, dynamic>?> _driveByCoordinate(
+    String command,
+    int x,
+    int y, {
+    int? dx,
+    int? dy,
+  }) async {
+    final prober = _driverExtension?.prober;
+    if (prober == null) {
+      return {'isError': true};
+    }
+    try {
+      if (command == 'scroll' && dx != null && dy != null) {
+        await prober.dragFrom(
+          Offset(x.toDouble(), y.toDouble()),
+          Offset(dx.toDouble(), dy.toDouble()),
+        );
+      } else {
+        await prober.tapAt(Offset(x.toDouble(), y.toDouble()));
+      }
+      return {'isError': false};
+    } catch (e) {
+      return {'isError': true};
+    }
   }
 
   /// Sends a `flutter_driver` finder-based command (tap/scroll/enter_text) via the driver
@@ -603,14 +937,47 @@ class AppiumHandler {
       params['frequency'] = '60';
     }
     if (command == 'enter_text') {
+      await _focusForTextEntry({'finderType': finderType, finderValueKey: value});
       params['text'] = enterText!;
     }
-    final result = await _driverExtension?.call(params);
+    final result = await _callDriverExtension(params);
     if (result != null && result['isError'] != true) {
       result['foundBy'] = foundBy;
       result['value'] = value;
+      if (command == 'enter_text') {
+        await _submitTextEntry();
+        result['submitted'] = true;
+      }
     }
     return result;
+  }
+
+  /// `EnterText` (unlike `tap`/`scroll`) ignores whatever finder is sent along with it - it just
+  /// types into whichever widget currently has keyboard focus (`TestTextInput.enterText`, see
+  /// `handler_factory.dart#_enterText`). Without an actual tap first, nothing has focus (or
+  /// something unrelated still does), so the text has nowhere to go.
+  ///
+  /// Order matters here: text entry emulation (`TestTextInput.register()`) must be enabled
+  /// *before* the tap, not after. Registering swaps the platform's `flutter/textinput` channel
+  /// handler for a fake one that only learns the active connection's client id by intercepting
+  /// the `TextInput.setClient` call the framework makes when a field is focused/attached
+  /// (`TestTextInput._client`, set from inside that intercepted call). If the tap (and the
+  /// `TextInput.attach` it triggers) happens first, that `setClient` call goes to the real
+  /// platform channel instead, `_client` is never captured, and `EnterText` silently has no
+  /// connection to send the typed text to - which is exactly what was happening before this was
+  /// reordered.
+  Future<void> _focusForTextEntry(Map<String, String> finderParams) async {
+    await _callDriverExtension({'command': 'set_text_entry_emulation', 'enabled': 'true'});
+    await _callDriverExtension({...finderParams, 'command': 'tap'});
+  }
+
+  /// Sends the on-screen keyboard's "Done" action after entering text (`send_text_input_action`,
+  /// `TestTextInput.receiveAction` under the hood - see `handler_factory.dart#_sendTextInputAction`),
+  /// so a field's `onSubmitted`/`onFieldSubmitted` fires the same way it would for a real user
+  /// pressing the keyboard's action button. `EnterText` alone only updates the field's text; it
+  /// doesn't simulate submitting it.
+  Future<void> _submitTextEntry() async {
+    await _callDriverExtension({'command': 'send_text_input_action', 'action': 'done'});
   }
 
   Future<Map<String, dynamic>?> _driveKey(
@@ -632,16 +999,6 @@ class AppiumHandler {
       return {'isError': false, 'foundBy': 'byValueKey', 'value': key};
     }
 
-    if (command == 'enter_text') {
-      await _driverExtension?.call({
-        'command': 'set_text_entry_emulation',
-        'finderType': 'ByValueKey',
-        'keyValueString': 'textfield',
-        'keyValueType': 'String',
-        'enabled': 'true',
-      });
-    }
-
     final params = <String, String>{
       'command': command,
       'finderType': 'ByValueKey',
@@ -659,12 +1016,21 @@ class AppiumHandler {
       params['frequency'] = '60';
     }
     if (command == 'enter_text') {
+      await _focusForTextEntry({
+        'finderType': 'ByValueKey',
+        'keyValueString': key,
+        'keyValueType': 'String',
+      });
       params['text'] = enterText!;
     }
-    final result = await _driverExtension?.call(params);
+    final result = await _callDriverExtension(params);
     if (result != null && result['isError'] != true) {
       result['foundBy'] = 'byValueKey';
       result['value'] = key;
+      if (command == 'enter_text') {
+        await _submitTextEntry();
+        result['submitted'] = true;
+      }
     }
     return result;
   }
@@ -726,6 +1092,22 @@ class AppiumHandler {
       }
     }
     return contained;
+  }
+
+  /// Resolves the target node for a context-menu action. When the Inspector's disambiguation
+  /// submenu was used to pick a specific element among several overlapping candidates at the
+  /// same point, [elementId] carries that choice and is looked up directly; otherwise falls back
+  /// to coordinate hit-testing, matching the plain single-candidate behavior.
+  XmlNode? _resolveNode(int x, int y, String? elementId) {
+    if (elementId != null && elementId.isNotEmpty) {
+      for (final node in _document?.descendants ?? const <XmlNode>[]) {
+        if (node.getAttribute('id') == elementId) {
+          return node;
+        }
+      }
+      return null;
+    }
+    return _getNodeFromOffset(Offset(x.toDouble(), y.toDouble()));
   }
 
   Rect? _boundsToRect(String? bounds) {
