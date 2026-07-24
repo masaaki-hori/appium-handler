@@ -83,6 +83,22 @@ Three files in `lib/` divide the work:
 
 When modifying finder/command behavior, keep in mind the data flows one direction per call: driver command string → `appiumHandler` switch → (for page source) walk widget tree via `AppiumWidgetInspectorService` → cache as XML in `_document` → later commands resolve elements against that cached XML, not a live widget tree query.
 
+## Native OS dialogs (permission prompts, biometric auth, native error dialogs) — don't add native code here
+
+A recurring need when driving a real app through this stack is interacting with things that are **not Flutter widgets at all**: OS permission dialogs (camera/notification), `BiometricPrompt`/screen-lock PIN confirmation during FIDO registration, and even some in-app `AlertDialog`s that for whatever reason never show up in `getPageSource`'s XML (confirmed missing: the app's own generic error dialog, e.g. after a failed card registration — its title/message/OK button text is simply absent from the tree even though the dialog is visibly on screen and `mCurrentFocus` still reports the Flutter `MainActivity`, not a separate native Activity).
+
+**Don't solve this by adding native (Kotlin/Swift) code to this package.** `appium-flutter-driver` already has exactly this capability built in and it works today, verified end-to-end (2026-07): the driver's `NATIVE_APP` context (`setContext`/`getContexts`, see `appium-flutter-driver/CLAUDE.md`'s "Three contexts" section) is proxied in-process to a real `UiAutomator2Driver` (Android) / `XCUITestDriver` (iOS) — the same driver a plain non-Flutter Appium session would use. Switching to it gets you the actual `AccessibilityNodeInfo`-based UI tree (real `resource-id`s, raw device-pixel `bounds`, `content-desc`) for *whatever* is currently on screen, Flutter or not.
+
+Confirmed working recipe (BiometricPrompt PIN confirmation, via raw WebDriver calls — this is exactly what Appium Inspector's context-switch UI does under the hood):
+1. While still in `FLUTTER` context, tap whatever triggers the native prompt (e.g. the app's own "認証する" button).
+2. `POST /session/:id/context {"name": "NATIVE_APP"}`.
+3. `GET /session/:id/source` now returns a real `<hierarchy>` (`android.widget.*`, package `com.android.systemui` for system dialogs) instead of the `appium_handler` XML — search it for the target `resource-id` (e.g. `com.android.systemui:id/lockPassword` for the PIN field).
+4. `POST /session/:id/element {"using":"id","value":"<resource-id>"}` then `POST /session/:id/element/:id/value {"text":"1234"}` — standard element find + `sendKeys`, no coordinate guessing needed.
+5. Submit (e.g. `adb shell input keyevent KEYCODE_ENTER`, or find and tap a real submit button the same way).
+6. `POST /session/:id/context {"name":"FLUTTER"}` to resume normal Flutter-side automation.
+
+Gotcha: starting a *new* Flutter-driver session (`POST /session` with `appium:noReset: true`) fails with `No observatory URL matching ... was found in the device log` if the target app is already running — the driver only picks up the Dart VM Service URL from a fresh process's log output, not from a still-running one. Run `adb shell am force-stop <appPackage>` first, then create the session, so the launch produces a fresh Observatory log line.
+
 ## Repo layout notes
 
 The repo root also contains several near-duplicate long-form write-ups of this project as a Qiita article draft (`README.md`, `Qiita.md`, `ChatGPT.md`, `Gemini.md`, `perplexity.md`, `wrtn.md`, plus `images/`) — these are article drafts for publication, not architecture docs; don't treat divergences between them as bugs to reconcile.

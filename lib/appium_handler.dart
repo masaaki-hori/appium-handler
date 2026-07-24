@@ -486,6 +486,25 @@ class AppiumHandler {
             }
           }
           break;
+        case 'tap':
+          // Unlike the plain W3C 'pointerUp' tap above (which always hit-tests the coordinate
+          // itself), this supports Appium Inspector's disambiguation submenu passing an explicit
+          // 'elementId' when more than one element's bounds contained the clicked point.
+          final node = _resolveNode(x!, y!, action['elementId'] as String?);
+          if (node != null) {
+            final result = await _execCommandWithFinder(
+              x,
+              y,
+              node,
+              'tap',
+              foundBy: foundBy,
+              value: foundValue,
+            );
+            if (result != null && result['isError'] != true) {
+              return _actionResult(node, result);
+            }
+          }
+          break;
       }
     }
     return '{}';
@@ -1098,11 +1117,27 @@ class AppiumHandler {
   /// submenu was used to pick a specific element among several overlapping candidates at the
   /// same point, [elementId] carries that choice and is looked up directly; otherwise falls back
   /// to coordinate hit-testing, matching the plain single-candidate behavior.
+  ///
+  /// [id]s (`inspector-N`) aren't stable identifiers for a given widget - they're assigned fresh,
+  /// in traversal order, on every `getPageSource` call. The disambiguation submenu captures one
+  /// at right-click time, but the action it drives (tap/enterText/checkText/checkExistence) only
+  /// fires later, when the user picks an item - if a page-source refresh lands in between (the
+  /// periodic auto-refresh, or the user switching to NATIVE_APP context and back), that same id
+  /// string can now belong to a completely different widget that happens to occupy it in the
+  /// rebuilt tree, rather than the one the user actually selected. Silently trusting a same-id
+  /// match after that would act on the wrong widget - which looks indistinguishable from a stray
+  /// coordinate-based tap landing wherever that widget happens to be. Cross-checking that the
+  /// found node's own bounds still contain the original click point catches this: a genuinely
+  /// current id always satisfies it (that's where the user right-clicked), while a stale/reused
+  /// one usually won't.
   XmlNode? _resolveNode(int x, int y, String? elementId) {
     if (elementId != null && elementId.isNotEmpty) {
+      final pos = Offset(x.toDouble(), y.toDouble());
       for (final node in _document?.descendants ?? const <XmlNode>[]) {
         if (node.getAttribute('id') == elementId) {
-          return node;
+          final bounds = node.getAttribute('bounds');
+          final rect = bounds != null ? _boundsToRect(bounds) : null;
+          return (rect != null && rect.contains(pos)) ? node : null;
         }
       }
       return null;
