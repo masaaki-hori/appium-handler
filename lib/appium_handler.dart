@@ -268,7 +268,7 @@ class AppiumHandler {
         value = semanticLabel;
       }
       final key = node.getAttribute('key');
-      if (key != null && key.isNotEmpty) {
+      if (key != null && key.isNotEmpty && key != 'null') {
         foundBy = 'byValueKey';
         value = key;
       }
@@ -354,7 +354,7 @@ class AppiumHandler {
       });
     }
     final key = node.getAttribute('key');
-    if (key != null && key.isNotEmpty) {
+    if (key != null && key.isNotEmpty && key != 'null') {
       return jsonEncode({...result, 'foundBy': 'byValueKey', 'value': key});
     }
     final text = result['text'];
@@ -638,7 +638,7 @@ class AppiumHandler {
       return (foundBy: 'byValueKey', value: value!);
     }
     final key = node.getAttribute('key');
-    if (key != null && key.isNotEmpty) {
+    if (key != null && key.isNotEmpty && key != 'null') {
       return (foundBy: 'byValueKey', value: key);
     }
     if (foundBy == 'byText') {
@@ -729,7 +729,7 @@ class AppiumHandler {
       );
     }
     final key = node.getAttribute('key');
-    if (key != null && key.isNotEmpty) {
+    if (key != null && key.isNotEmpty && key != 'null') {
       return _driveKey(
         command,
         key,
@@ -1099,18 +1099,55 @@ class AppiumHandler {
     return node.getAttribute('tooltip');
   }
 
-  XmlNode? _getNodeFromOffset(Offset pos) {
-    XmlNode? contained;
-    for (final node in (_document?.descendants.toList() ?? []).reversed) {
-      final bounds = node.getAttribute('bounds');
-      if (bounds == null) {
-        continue;
-      }
-      if (contained == null && _boundsToRect(bounds)!.contains(pos)) {
-        contained = node;
+  /// Whether [node] carries an attribute a generated locator could actually use - the same
+  /// tooltip/semanticLabel/key/text set `_execCommandWithFinderChain`'s priority chain checks.
+  /// Guards against the 'key' attribute's own "null" string quirk (an absent key is serialized
+  /// as the literal text "null", not an empty attribute - see `visitorTree` above) as well as
+  /// the usual empty-string case.
+  bool _hasIdentifyingAttribute(XmlNode node) {
+    for (final name in const ['tooltip', 'semanticLabel', 'key', 'text']) {
+      final value = node.getAttribute(name);
+      if (value != null && value.isNotEmpty && value != 'null') {
+        return true;
       }
     }
-    return contained;
+    return false;
+  }
+
+  /// Resolves the widget at [pos]: the most specific (deepest) matching node, unless a
+  /// same-bounds ancestor directly above it is the only one in that chain with an identifying
+  /// attribute (see `_hasIdentifyingAttribute`). Such ancestors (e.g. a `Semantics` wrapper
+  /// around a plain RenderObject-level widget) are otherwise invisible here: their bounds
+  /// exactly match their child's, so always taking "the deepest match" silently prefers the
+  /// unnamed RenderObject over the widget that's actually nameable, which then can only be
+  /// acted on/recorded by raw coordinates. Mirrors `collapsePassThroughAncestors` in
+  /// appium-inspector's `element-hit-testing.js`, which applies the same idea client-side for
+  /// the right-click disambiguation menu.
+  XmlNode? _getNodeFromOffset(Offset pos) {
+    XmlNode? best;
+    for (final node in (_document?.descendants.toList() ?? []).reversed) {
+      final bounds = node.getAttribute('bounds');
+      if (bounds == null || !_boundsToRect(bounds)!.contains(pos)) {
+        continue;
+      }
+
+      if (best == null) {
+        best = node;
+        continue;
+      }
+
+      final isSameTarget = bounds == best.getAttribute('bounds') && best.ancestors.contains(node);
+      if (!isSameTarget) {
+        // 'node' is outside best's own same-bounds chain (an unrelated overlap, or simply a
+        // genuinely larger ancestor) - stop here rather than risk climbing arbitrarily far up
+        // the tree looking for a name.
+        break;
+      }
+      if (!_hasIdentifyingAttribute(best) && _hasIdentifyingAttribute(node)) {
+        best = node;
+      }
+    }
+    return best;
   }
 
   /// Resolves the target node for a context-menu action. When the Inspector's disambiguation
