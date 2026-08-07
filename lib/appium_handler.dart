@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:xml/xml.dart';
 
@@ -278,7 +279,9 @@ class AppiumHandler {
         value = text;
       }
     }
-    return '{"isError": false, "foundBy": "$foundBy", "text": "$value"}';
+    // jsonEncode (not manual string interpolation) so an unmatched id - foundBy/value staying
+    // null - encodes as JSON null rather than the literal string "null" (see '_actionResult').
+    return jsonEncode({'isError': false, 'foundBy': foundBy, 'text': value});
   }
 
   /// Resolves a synthetic element id (from a prior `findElement`/`getPageSource` call) back to a
@@ -436,11 +439,22 @@ class AppiumHandler {
           }
           break;
         case 'enterText':
-          final node = _resolveNode(x!, y!, action['elementId'] as String?);
+          // x/y, elementId and foundBy/value are all nullable/optional here - see the 'tap' case
+          // below for why, and '_findNodeByLocator' for the foundBy/value-only fallback (e.g. a
+          // hand-authored WebdriverIO/Python replay of a recorded locator, with no click point or
+          // elementId at all).
+          final node =
+              _resolveNode(x, y, action['elementId'] as String?) ??
+              _findNodeByLocator(foundBy, foundValue);
           if (node != null) {
+            final rect = x == null || y == null
+                ? _boundsToRect(node.getAttribute('bounds'))
+                : null;
+            final resolvedX = x ?? rect?.center.dx.toInt() ?? 0;
+            final resolvedY = y ?? rect?.center.dy.toInt() ?? 0;
             final result = await _execCommandWithFinder(
-              x,
-              y,
+              resolvedX,
+              resolvedY,
               node,
               'enter_text',
               enterText: action['text'],
@@ -453,11 +467,18 @@ class AppiumHandler {
           }
           break;
         case 'checkText':
-          final node = _resolveNode(x!, y!, action['elementId'] as String?);
+          final node =
+              _resolveNode(x, y, action['elementId'] as String?) ??
+              _findNodeByLocator(foundBy, foundValue);
           if (node != null) {
+            final rect = x == null || y == null
+                ? _boundsToRect(node.getAttribute('bounds'))
+                : null;
+            final resolvedX = x ?? rect?.center.dx.toInt() ?? 0;
+            final resolvedY = y ?? rect?.center.dy.toInt() ?? 0;
             final result = await _execCommandWithFinder(
-              x,
-              y,
+              resolvedX,
+              resolvedY,
               node,
               'check_text',
               enterText: action['text'],
@@ -470,11 +491,22 @@ class AppiumHandler {
           }
           break;
         case 'checkExistence':
-          final node = _resolveNode(x!, y!, action['elementId'] as String?);
+          // Falling through to '{}' below (see the end of this method) when neither resolution
+          // path finds a node is what makes this an actual existence check - not just a "which
+          // locator would I use" report - for the foundBy/value-only case same as for
+          // elementId/coordinate.
+          final node =
+              _resolveNode(x, y, action['elementId'] as String?) ??
+              _findNodeByLocator(foundBy, foundValue);
           if (node != null) {
+            final rect = x == null || y == null
+                ? _boundsToRect(node.getAttribute('bounds'))
+                : null;
+            final resolvedX = x ?? rect?.center.dx.toInt() ?? 0;
+            final resolvedY = y ?? rect?.center.dy.toInt() ?? 0;
             final result = await _execCommandWithFinder(
-              x,
-              y,
+              resolvedX,
+              resolvedY,
               node,
               'check_existence',
               enterText: '',
@@ -488,13 +520,28 @@ class AppiumHandler {
           break;
         case 'tap':
           // Unlike the plain W3C 'pointerUp' tap above (which always hit-tests the coordinate
-          // itself), this supports Appium Inspector's disambiguation submenu passing an explicit
-          // 'elementId' when more than one element's bounds contained the clicked point.
-          final node = _resolveNode(x!, y!, action['elementId'] as String?);
+          // itself), this supports several elementId/locator-driven callers: Appium Inspector's
+          // disambiguation submenu (a real click point plus 'elementId', when more than one
+          // element's bounds contained it - x/y are set here from a preceding 'pointerMove'),
+          // appium-flutter-driver's standard 'elementClick' passthrough (id only, no click point
+          // at all - see 'driver.ts'), and hand-authored WebdriverIO/Python code replaying a
+          // recorded foundBy/value locator with neither an id nor a click point. x/y stay nullable
+          // through here for all of these.
+          final tapElementId = action['elementId'] as String?;
+          final node =
+              _resolveNode(x, y, tapElementId) ?? _findNodeByLocator(foundBy, foundValue);
           if (node != null) {
+            // _execCommandWithFinder wants concrete coordinates (used for its final
+            // _driveByCoordinate fallback) - derive them from the resolved node's own bounds
+            // when the caller didn't supply a click point.
+            final rect = x == null || y == null
+                ? _boundsToRect(node.getAttribute('bounds'))
+                : null;
+            final resolvedX = x ?? rect?.center.dx.toInt() ?? 0;
+            final resolvedY = y ?? rect?.center.dy.toInt() ?? 0;
             final result = await _execCommandWithFinder(
-              x,
-              y,
+              resolvedX,
+              resolvedY,
               node,
               'tap',
               foundBy: foundBy,
@@ -505,18 +552,111 @@ class AppiumHandler {
             }
           }
           break;
+        case 'tapDirect':
+          // See `_driveByDirectCallback` below - bypasses hit-testing entirely, for widgets that a
+          // normal 'tap' can't reliably reach because something else (a coach-mark overlay, a
+          // dialog barrier) visually covers them at that point.
+          final directElementId = action['elementId'] as String?;
+          final directNode =
+              _resolveNode(x, y, directElementId) ?? _findNodeByLocator(foundBy, foundValue);
+          if (directNode != null) {
+            final id = directNode.getAttribute('id');
+            if (id != null && id.isNotEmpty) {
+              final result = _driveByDirectCallback(id);
+              if (result['isError'] != true) {
+                final locator = await _computeRecordableLocator(
+                  directNode,
+                  foundBy: foundBy,
+                  value: foundValue,
+                );
+                result['foundBy'] = locator.foundBy;
+                result['value'] = locator.value;
+                return _actionResult(directNode, result);
+              }
+            }
+          }
+          break;
       }
     }
     return '{}';
+  }
+
+  /// Bypasses flutter_driver's hit-test-based tap entirely by resolving [id] to its underlying
+  /// `Element` (the same `WidgetInspectorService.toObject` lookup `ByIdFinderExtension` uses) and
+  /// calling the nearest `InkResponse` (which `InkWell` extends) or `GestureDetector` ancestor's
+  /// `onTap` callback directly, as a plain Dart function call.
+  ///
+  /// Every other tap path in this file (`_driveById`/`_driveKey`/`_driveFinder`/
+  /// `_driveByTypeIndex`/`_driveByCoordinate`) ultimately goes through `LiveWidgetController.tap`,
+  /// which computes a screen coordinate and synthesizes a real pointer gesture there - hit-tested
+  /// against whatever is currently painted on top at that point. A locator can resolve to exactly
+  /// the right widget and the tap can still land on an unrelated overlay sitting above it (a
+  /// coach-mark highlight, a dialog barrier) instead - and flutter_driver's tap command reports
+  /// success regardless, since dispatching the gesture didn't throw. This sidesteps that: it never
+  /// looks at paint order or screen coordinates at all, so it can't be intercepted by anything
+  /// visually on top.
+  ///
+  /// Opt-in via a distinct 'tapDirect' action type (see `_performActions` above) rather than
+  /// folded into the existing tap fallback chain, so every already-recorded script's plain 'tap'
+  /// keeps its current, hit-test-based behavior unchanged.
+  Map<String, dynamic> _driveByDirectCallback(String id) {
+    Object? object;
+    try {
+      // ignore: invalid_use_of_protected_member
+      object = _inspectorService?.toObject(id);
+    } catch (e) {
+      return {'isError': true, 'response': 'toObject($id) failed: $e'};
+    }
+    if (object is! Element) {
+      return {'isError': true, 'response': 'no live Element for page-source id "$id"'};
+    }
+
+    VoidCallback? onTap;
+    bool checkWidget(Widget widget) {
+      if (widget is InkResponse) {
+        onTap = widget.onTap;
+      } else if (widget is GestureDetector) {
+        onTap = widget.onTap;
+      }
+      return onTap != null;
+    }
+
+    if (!checkWidget(object.widget)) {
+      object.visitAncestorElements((ancestor) => !checkWidget(ancestor.widget));
+    }
+
+    if (onTap == null) {
+      return {
+        'isError': true,
+        'response':
+            'no InkResponse/GestureDetector.onTap found for id "$id" or its ancestors',
+      };
+    }
+    onTap!();
+    return {'isError': false};
   }
 
   String _actionResult(XmlNode node, Map<String, dynamic> result) {
     // 'submitted' is only ever set (by _submitTextEntry's callers) for a successful enter_text -
     // appium-inspector uses it to decide whether the generated code also needs a
     // TextInputAction.done step after entering the text, matching what actually happened live.
-    return '{"text":"${node.getAttribute('text')}","elementId":"${node.getAttribute('id')}",'
-        '"type":"${node.getAttribute('class')}","foundBy":"${result['foundBy']}","value":"${result['value']}",'
-        '"submitted":${result['submitted'] == true}}';
+    //
+    // Built via jsonEncode (not manual string interpolation) so a null field - notably 'foundBy'/
+    // 'value' when [result] came from '_driveByCoordinate', which deliberately omits them for a
+    // widget with no reliable locator - encodes as JSON null rather than the literal 4-character
+    // string "null" that '"${result['foundBy']}"' would produce. That string is truthy on the JS
+    // side (both 'parseFlutterFinderFromResponse's 'foundBy && value' check and js-wdio.js's
+    // generated 'Boolean(foundBy)' checks), so a tap that deliberately couldn't resolve a locator
+    // was being recorded/replayed as if it had - the same string-interpolation trap the 'key'
+    // attribute in '_getPageSource' had.
+    return jsonEncode({
+      'text': node.getAttribute('text'),
+      'elementId': node.getAttribute('id'),
+      'type': node.getAttribute('class'),
+      'foundBy': result['foundBy'],
+      'value': result['value'],
+      'submitted': result['submitted'] == true,
+    });
   }
 
   Future<Map<String, dynamic>?> _execCommandWithFinder(
@@ -764,7 +904,21 @@ class AppiumHandler {
         dy: dy,
       );
     }
-    final type = foundBy == 'byType' ? value! : node.getAttribute('class')!;
+    // `value` for `byType` is the combined "Type#index" form produced by `_computeRecordableLocator`
+    // (e.g. "InkWell#11"), not a bare type name - it must be split before use, otherwise both the
+    // `ByType` finder below and `_typeIndexOf` compare against a type name that can never match
+    // (no widget's runtime type literally contains "#11"), and every locator-based tap for a
+    // `byType`-recorded action silently falls through to the raw-coordinate last resort, which
+    // still taps successfully but reports no `foundBy`/`value` back to the caller.
+    String type;
+    int? recordedIndex;
+    if (foundBy == 'byType') {
+      final parts = value!.split('#');
+      type = parts[0];
+      recordedIndex = parts.length > 1 ? int.tryParse(parts[1]) : null;
+    } else {
+      type = node.getAttribute('class')!;
+    }
     final result = await _driveFinder(
       command,
       'ByType',
@@ -786,8 +940,10 @@ class AppiumHandler {
     // from flutter_test. Retry narrowed to this node's position among same-typed nodes in the
     // last-fetched page source - a valid, replayable locator (`find.byType(X).at(N)`) as long as
     // the element tree's evaluation order doesn't change between now and when a generated test
-    // using it runs.
-    final index = _typeIndexOf(node, type);
+    // using it runs. If the caller already recorded this exact index (a `byType` locator being
+    // replayed), reuse it directly instead of recomputing - it's what identified `node` in the
+    // first place, so it's already known to resolve correctly right now.
+    final index = recordedIndex ?? _typeIndexOf(node, type);
     if (index != null) {
       final indexedResult = await _driveByTypeIndex(
         command,
@@ -1167,19 +1323,96 @@ class AppiumHandler {
   /// found node's own bounds still contain the original click point catches this: a genuinely
   /// current id always satisfies it (that's where the user right-clicked), while a stale/reused
   /// one usually won't.
-  XmlNode? _resolveNode(int x, int y, String? elementId) {
+  ///
+  /// [x]/[y] are nullable to also serve appium-flutter-driver's standard 'elementClick' passthrough
+  /// (see 'driver.ts'), which only has an id - no click point to cross-check against at all, since
+  /// it wasn't driven from a screenshot click. In that case the id match is trusted outright.
+  XmlNode? _resolveNode(int? x, int? y, String? elementId) {
     if (elementId != null && elementId.isNotEmpty) {
-      final pos = Offset(x.toDouble(), y.toDouble());
       for (final node in _document?.descendants ?? const <XmlNode>[]) {
-        if (node.getAttribute('id') == elementId) {
-          final bounds = node.getAttribute('bounds');
-          final rect = bounds != null ? _boundsToRect(bounds) : null;
-          return (rect != null && rect.contains(pos)) ? node : null;
+        if (node.getAttribute('id') != elementId) {
+          continue;
         }
+        if (x == null || y == null) {
+          return node;
+        }
+        final pos = Offset(x.toDouble(), y.toDouble());
+        final bounds = node.getAttribute('bounds');
+        final rect = bounds != null ? _boundsToRect(bounds) : null;
+        return (rect != null && rect.contains(pos)) ? node : null;
       }
       return null;
     }
+    if (x == null || y == null) {
+      return null;
+    }
     return _getNodeFromOffset(Offset(x.toDouble(), y.toDouble()));
+  }
+
+  /// Resolves a recorded Flutter locator ([foundBy]/[value], the same shape
+  /// `_computeRecordableLocator` echoes back to Appium Inspector for code generation) back to a
+  /// live node in the current page source - the mirror image of `_computeRecordableLocator`.
+  ///
+  /// Used as a fallback in `_performActions` when a caller supplies only a recorded locator with
+  /// no elementId and no click point at all - e.g. hand-authored WebdriverIO/Python code replaying
+  /// a locator captured from an earlier interactive recording, rather than driving live through
+  /// Appium Inspector's own screenshot clicks. Once resolved, the node flows through the exact same
+  /// `_execCommandWithFinder`/`_execCommandWithFinderChain` path as an elementId/coordinate-resolved
+  /// one, so tap/enterText/checkText/checkExistence all behave identically either way - including
+  /// falling through to the caller's existing "not found" handling (`return '{}'` in
+  /// `_performActions`) when nothing currently matches, which doubles as checkExistence's actual
+  /// existence check.
+  XmlNode? _findNodeByLocator(String? foundBy, String? value) {
+    if (foundBy == null || value == null || value.isEmpty) {
+      return null;
+    }
+    if (foundBy == 'byType') {
+      // 'value' may be a bare type name, or 'Type#index' (see '_typeIndexOf') when a plain type
+      // match was ambiguous at recording time (more than one node shared the type) and got
+      // narrowed to a specific position among them. The indexed form needs a dedicated counting
+      // pass in document order - the same order '_typeIndexOf' counts in - rather than the
+      // single-node attribute check every other case below does.
+      final parts = value.split('#');
+      final type = parts[0];
+      final index = parts.length > 1 ? int.tryParse(parts[1]) : null;
+      var count = 0;
+      for (final candidate in _document?.descendants ?? const <XmlNode>[]) {
+        if (candidate.getAttribute('class') != type) {
+          continue;
+        }
+        if (index == null || count == index) {
+          return candidate;
+        }
+        count++;
+      }
+      return null;
+    }
+    for (final node in _document?.descendants ?? const <XmlNode>[]) {
+      switch (foundBy) {
+        case 'byTooltip':
+          if (node.getAttribute('tooltip') == value) {
+            return node;
+          }
+          break;
+        case 'bySemanticsLabel':
+          if (node.getAttribute('semanticLabel') == value) {
+            return node;
+          }
+          break;
+        case 'byValueKey':
+          final key = node.getAttribute('key');
+          if (key == value && key != 'null') {
+            return node;
+          }
+          break;
+        case 'byText':
+          if (node.getAttribute('text') == value) {
+            return node;
+          }
+          break;
+      }
+    }
+    return null;
   }
 
   Rect? _boundsToRect(String? bounds) {
