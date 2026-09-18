@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:xml/xml.dart';
@@ -1270,40 +1271,132 @@ class AppiumHandler {
     return false;
   }
 
-  /// Resolves the widget at [pos]: the most specific (deepest) matching node, unless a
-  /// same-bounds ancestor directly above it is the only one in that chain with an identifying
-  /// attribute (see `_hasIdentifyingAttribute`). Such ancestors (e.g. a `Semantics` wrapper
-  /// around a plain RenderObject-level widget) are otherwise invisible here: their bounds
-  /// exactly match their child's, so always taking "the deepest match" silently prefers the
-  /// unnamed RenderObject over the widget that's actually nameable, which then can only be
-  /// acted on/recorded by raw coordinates. Mirrors `collapsePassThroughAncestors` in
-  /// appium-inspector's `element-hit-testing.js`, which applies the same idea client-side for
-  /// the right-click disambiguation menu.
-  XmlNode? _getNodeFromOffset(Offset pos) {
-    XmlNode? best;
-    for (final node in (_document?.descendants.toList() ?? []).reversed) {
-      final bounds = node.getAttribute('bounds');
-      if (bounds == null || !_boundsToRect(bounds)!.contains(pos)) {
+  /// Performs a real Flutter hit test at [pos] - the exact mechanism Flutter's own gesture
+  /// pipeline uses to decide which widget receives a tap (`GestureBinding.handlePointerEvent`
+  /// calls this same `hitTestInView` before dispatching any event) - and maps the result back to
+  /// the corresponding node in `_document`.
+  ///
+  /// Each page-source node's `id` attribute is a `WidgetInspectorService` id (see `visitorTree`
+  /// above), resolvable back to its live `Element` via `toObject` - the same lookup
+  /// `_driveByDirectCallback` already uses. From there `Element.renderObject` gives the
+  /// `RenderObject` a real hit test would actually report, so `result.path` (ordered
+  /// front-to-back - `HitTestResult.path`'s own doc says "the first entry ... is the most
+  /// specific") can be walked to find the first entry that corresponds to a node in `_document`:
+  /// the genuinely topmost widget at this exact point.
+  ///
+  /// This replaces the previous heuristic (page-source document order, reversed, as a proxy for
+  /// paint order), which this app's habit of keeping multiple screens mounted simultaneously at
+  /// overlapping bounds could fool: two unrelated widgets from different (visible vs. offstage)
+  /// screens can share identical bounds, and document order alone can't tell which one is
+  /// actually on top - confirmed on-device via a StackTrace-instrumented debug build, where a
+  /// coordinate tap aimed at the Home AppBar's メニュー button was instead delivered to the
+  /// bottom-nav's 処方箋情報送信 tab, several document-positions away but coincidentally
+  /// overlapping at that point (see mhv2-app's E2E suite, qa-test_01-01_part1.js). A real hit
+  /// test can't make that mistake, since it walks the actual render tree instead of guessing from
+  /// a flattened list.
+  XmlNode? _hitTestNodeFromOffset(Offset pos) {
+    final document = _document;
+    final inspectorService = _inspectorService;
+    if (document == null || inspectorService == null) {
+      debugPrint('[appium_handler][hitTest] no _document/_inspectorService at $pos');
+      return null;
+    }
+
+    final result = HitTestResult();
+    final viewId = PlatformDispatcher.instance.views.first.viewId;
+    WidgetsBinding.instance.hitTestInView(result, pos, viewId);
+
+    // Built fresh per call (rather than cached alongside `_document`) since it's keyed by live
+    // `RenderObject` identity - always safe as long as this runs against the same `_document`/
+    // `_inspectorService` pair a preceding `getPageSource()` just produced, which
+    // `retryFlutterAction` on the driver side already guarantees by refreshing the page source
+    // before every attempt.
+    final Map<RenderObject, XmlNode> renderObjectToNode = {};
+    var totalNodes = 0;
+    var toObjectFailures = 0;
+    for (final node in document.descendants) {
+      final id = node.getAttribute('id');
+      if (id == null || id.isEmpty) {
         continue;
       }
-
-      if (best == null) {
-        best = node;
+      totalNodes++;
+      Object? object;
+      try {
+        // ignore: invalid_use_of_protected_member
+        object = inspectorService.toObject(id);
+      } catch (_) {
+        toObjectFailures++;
         continue;
       }
+      final renderObject = object is Element ? object.renderObject : null;
+      if (renderObject != null) {
+        // When several page-source nodes resolve to the same RenderObject (e.g. a `Semantics`
+        // wrapper and the plain widget it wraps), the later - deeper, per document order - one
+        // wins here; `_collapseToIdentifyingAncestor` below climbs back up from it if a shallower
+        // ancestor turns out to be the one actually worth naming.
+        renderObjectToNode[renderObject] = node;
+      }
+    }
+    debugPrint(
+      '[appium_handler][hitTest] pos=$pos viewId=$viewId pathLength=${result.path.length} '
+      'documentNodes=$totalNodes toObjectFailures=$toObjectFailures mapped=${renderObjectToNode.length}',
+    );
 
-      final isSameTarget = bounds == best.getAttribute('bounds') && best.ancestors.contains(node);
-      if (!isSameTarget) {
-        // 'node' is outside best's own same-bounds chain (an unrelated overlap, or simply a
-        // genuinely larger ancestor) - stop here rather than risk climbing arbitrarily far up
-        // the tree looking for a name.
+    var i = 0;
+    for (final entry in result.path) {
+      final target = entry.target;
+      final node = target is RenderObject ? renderObjectToNode[target] : null;
+      if (i < 20) {
+        debugPrint(
+          '[appium_handler][hitTest]   path[$i] target=${target.runtimeType} '
+          'matched=${node != null ? '${node.getAttribute('class')}#${node.getAttribute('id')}' : 'no'}',
+        );
+      }
+      i++;
+      if (node != null) {
+        debugPrint(
+          '[appium_handler][hitTest] => RESOLVED at path[$i-1]: '
+          '${node.getAttribute('class')} id=${node.getAttribute('id')} bounds=${node.getAttribute('bounds')}',
+        );
+        return node;
+      }
+    }
+    debugPrint('[appium_handler][hitTest] => NO MATCH in ${result.path.length} path entries');
+    return null;
+  }
+
+  /// Climbs from [start] through true tree ancestors (`XmlNode.ancestorElements`, not merely
+  /// document-adjacent nodes) sharing the exact same `bounds`, preferring one with an
+  /// identifying attribute (see `_hasIdentifyingAttribute`) over [start] itself. Such ancestors
+  /// (e.g. a `Semantics` wrapper around a plain RenderObject-level widget) are otherwise
+  /// invisible here: their bounds exactly match their child's, so always taking the raw
+  /// hit-tested node silently prefers the unnamed RenderObject over the widget that's actually
+  /// nameable, which then can only be acted on/recorded by raw coordinates. Mirrors
+  /// `collapsePassThroughAncestors` in appium-inspector's `element-hit-testing.js`, which applies
+  /// the same idea client-side for the right-click disambiguation menu.
+  XmlNode _collapseToIdentifyingAncestor(XmlNode start) {
+    var best = start;
+    final bounds = start.getAttribute('bounds');
+    for (final ancestor in start.ancestorElements) {
+      if (ancestor.getAttribute('bounds') != bounds) {
+        // Bounds diverge - genuinely left start's own footprint, not just a pass-through wrapper.
         break;
       }
-      if (!_hasIdentifyingAttribute(best) && _hasIdentifyingAttribute(node)) {
-        best = node;
+      if (!_hasIdentifyingAttribute(best) && _hasIdentifyingAttribute(ancestor)) {
+        best = ancestor;
       }
     }
     return best;
+  }
+
+  /// Resolves the widget at [pos]: a real hit test (`_hitTestNodeFromOffset`), then collapsed up
+  /// to a same-bounds identifying ancestor if one exists (`_collapseToIdentifyingAncestor`).
+  XmlNode? _getNodeFromOffset(Offset pos) {
+    final hit = _hitTestNodeFromOffset(pos);
+    if (hit == null) {
+      return null;
+    }
+    return _collapseToIdentifyingAncestor(hit);
   }
 
   /// Resolves the target node for a context-menu action. When the Inspector's disambiguation
