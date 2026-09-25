@@ -727,7 +727,15 @@ class AppiumHandler {
     int? dy,
   }) async {
     if (command == 'enter_text') {
-      await _focusForTextEntry({'finderType': 'ById', 'id': id});
+      final focusResult = await _focusForTextEntry({'finderType': 'ById', 'id': id});
+      if (focusResult == null || focusResult['isError'] == true) {
+        // フォーカスが確立していないままTestTextInput.enterTextを呼んでも、テキストの行き先が
+        // ないまま静かに破棄されるだけなので、ここで打ち切ってエラーとして呼び出し側に返す。
+        return {
+          'isError': true,
+          'response': 'focus tap failed before enter_text: $focusResult',
+        };
+      }
     }
     final params = <String, String>{'command': command, 'finderType': 'ById', 'id': id};
     if (dx != null && dy != null) {
@@ -744,6 +752,12 @@ class AppiumHandler {
       params['text'] = enterText!;
     }
     final result = await _callDriverExtension(params);
+    // [一時デバッグ] enter_textコマンド自体の実行結果を確認するための出力(調査用、後で削除)。
+    if (command == 'enter_text') {
+      debugPrint(
+        '[DEBUG_HOLDER_NAME] _driveById enter_text id=$id text="$enterText" result=$result',
+      );
+    }
     if (command == 'enter_text' && result != null && result['isError'] != true) {
       await _submitTextEntry();
       result['submitted'] = true;
@@ -1113,7 +1127,15 @@ class AppiumHandler {
       params['frequency'] = '60';
     }
     if (command == 'enter_text') {
-      await _focusForTextEntry({'finderType': finderType, finderValueKey: value});
+      final focusResult = await _focusForTextEntry({'finderType': finderType, finderValueKey: value});
+      if (focusResult == null || focusResult['isError'] == true) {
+        // _driveByIdの同種の変更と同じ理由: フォーカスが確立していないままの
+        // enter_textを打ち切ってエラーを返す。
+        return {
+          'isError': true,
+          'response': 'focus tap failed before enter_text: $focusResult',
+        };
+      }
       params['text'] = enterText!;
     }
     final result = await _callDriverExtension(params);
@@ -1142,9 +1164,18 @@ class AppiumHandler {
   /// platform channel instead, `_client` is never captured, and `EnterText` silently has no
   /// connection to send the typed text to - which is exactly what was happening before this was
   /// reordered.
-  Future<void> _focusForTextEntry(Map<String, String> finderParams) async {
+  /// フォーカス用タップの結果を返す。実機確認済み: 対象がFlutterのリスト仮想化によって解決
+  /// 直後に破棄されうる位置(スクロール直後の端付近)にあると、このタップ自体が
+  /// 「timed out waiting for the finder to resolve」で失敗することがある。従来はこの戻り値を
+  /// 誰も見ておらず、タップが失敗してもenter_text自体は「エラーなし」で完了したかのように
+  /// 報告され、実際にはフォーカスが確立していないため入力したテキストが行き場を失って
+  /// 破棄される(呼び出し側からは検知できない)という問題があった。呼び出し側で結果を見て
+  /// enter_text全体を失敗として扱えるよう、この戻り値を返すようにする。
+  Future<Map<String, dynamic>?> _focusForTextEntry(
+    Map<String, String> finderParams,
+  ) async {
     await _callDriverExtension({'command': 'set_text_entry_emulation', 'enabled': 'true'});
-    await _callDriverExtension({...finderParams, 'command': 'tap'});
+    return _callDriverExtension({...finderParams, 'command': 'tap'});
   }
 
   /// Sends the on-screen keyboard's "Done" action after entering text (`send_text_input_action`,
