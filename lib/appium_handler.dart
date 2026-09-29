@@ -699,11 +699,25 @@ class AppiumHandler {
         result['value'] = locator.value;
         return result;
       }
+      // `enter_text` deliberately does NOT fall through to the tooltip/semanticsLabel/key/text/type
+      // chain below when the unambiguous id-based attempt fails. Unlike `tap` (where the chain's
+      // final `ByType`+`ByTypeIndex` fallback still resolves the *same* recorded index), the chain's
+      // `ByType` step for `enter_text` only ever taps a *plain*, non-indexed type name to establish
+      // focus (see `_focusForTextEntry`'s callers below) - with more than one `TextFormField` on
+      // screen (the normal case), that can silently focus and type into the wrong one instead of
+      // failing loudly. Confirmed on-device: after the id-based focus tap timed out (widget disposed
+      // between the page-source snapshot and the tap - see `resolveTextFormFieldIndexNearLabel` on
+      // the Node side), this fallback still reported `isError:false`, but the typed text landed
+      // nowhere near the intended field. Returning the id-based failure directly lets the caller's
+      // own retry (re-resolve against a fresh snapshot, then act immediately) run instead.
+      if (command == 'enter_text') {
+        return result;
+      }
     }
 
     // Only reached if resolving/acting by id somehow failed - e.g. the
     // `AppiumWidgetInspectorService` that minted this id has since been replaced by a newer
-    // `getPageSource` call.
+    // `getPageSource` call - for anything other than `enter_text` (see above).
     return _execCommandWithFinderChain(
       x,
       y,
