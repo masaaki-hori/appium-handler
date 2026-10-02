@@ -11,6 +11,22 @@ import 'package:xml/xml.dart';
 import 'appium_handler_extension.dart';
 import 'widget_tree.dart';
 
+// XML属性値として埋め込む前に特殊文字をエスケープする。実機で確認済み: GlobalKey<FormFieldState
+// <String>>のような型パラメータ付きキーの文字列表現(`<`/`>`を含む)や、テキスト内容に含まれる`&`
+// をエスケープせずそのまま埋め込むと、XmlDocument.parse(_source)がXmlParserExceptionで失敗し、
+// getPageSource()全体が例外を投げていた(地図を含む画面で再現: 毎回同じ行・列で失敗していた)。
+// `&`は`<`/`>`より先に置換する(先に`<`を`&lt;`に置換すると、そのエスケープ済み文字列内の`&`が
+// 二重エスケープされてしまうため)。
+String _escapeXmlAttribute(String? value) {
+  if (value == null) {
+    return '';
+  }
+  return value
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;');
+}
+
 /// Callback handler for the appium-flutter-driver `flutter:requestData` command, used to make
 /// Appium Inspector (and any other client that talks the W3C `findElement`/actions protocol) work
 /// against the FLUTTER context. Register it via:
@@ -123,10 +139,14 @@ class AppiumHandler {
           final topLeft = Offset(left, top);
           final bottomRight = Offset(left + width, top + height);
           _treeItemOffsets[valueId] = [topLeft, bottomRight];
-        } catch (e, stackTrace) {
-          debugPrint(
-            '[appium_handler] layoutTree failed for widget $valueId: $e\n$stackTrace',
-          );
+        } catch (e) {
+          // 実機確認済み: 地図のようなネイティブのPlatformViewを含む画面では、レイアウト情報を
+          // 持たないウィジェット(この関数の再帰対象)が深くネストして大量に存在し、その全てで
+          // ここに来る。以前はここで毎回フルスタックトレース(数百行)を出力しており、その出力
+          // コスト自体がgetPageSource()全体を実質ハングさせ、呼び出し元(Appium/Node側)で
+          // タイムアウトを引き起こしていた。この失敗は想定内・頻発するものでスタックトレースに
+          // 診断上の価値はないため、メッセージのみ出力する。
+          debugPrint('[appium_handler] layoutTree failed for widget $valueId: $e');
         }
 
         // 'hasChildren' is absent (null), rather than false, on some leaf widgets - treat
@@ -147,7 +167,13 @@ class AppiumHandler {
         var type = 'Unknown';
         try {
           final String runtimeType = element?['widgetRuntimeType'];
-          type = runtimeType.replaceAll('<', '-').replaceAll('>', '-');
+          // 実機確認済み: `<`/`>`だけを置換しても、ジェネリクスの型引数がnullable型(例:
+          // `ValueListenableBuilder<bool?>`)の場合、その`?`がタグ名に残ってしまい、XMLの
+          // タグ名として不正(かつ`<?`は処理命令の開始と紛らわしい)なため
+          // XmlDocument.parse(_source)がXmlParserException("> expected")で失敗していた
+          // (地図を含む画面で再現: 毎回同じ位置で失敗)。`?`に限らず今後同種の問題を防ぐため、
+          // XML Nameとして有効な文字(英数字/`.`/`-`/`_`/`:`)以外は全て`-`に置換する。
+          type = runtimeType.replaceAll(RegExp(r'[^A-Za-z0-9_.:-]'), '-');
 
           final properties = tree.myGetProperties(valueId, 'tree_1');
           String? key;
@@ -193,17 +219,19 @@ class AppiumHandler {
 
           ++_index;
           _source +=
-              '<$type id="$valueId" key="$key" index="$_index" class="$type" '
-              'text="${text ?? ''}" tooltip="${toolTip ?? ''}" '
+              '<$type id="$valueId" key="${_escapeXmlAttribute(key)}" index="$_index" class="$type" '
+              'text="${_escapeXmlAttribute(text)}" tooltip="${_escapeXmlAttribute(toolTip)}" '
               'bounds="[${topLeft.dx.toInt()},${topLeft.dy.toInt()}]'
               '[${bottomRight.dx.toInt()},${bottomRight.dy.toInt()}]" '
-              'enabled="${enabled ?? ''}" semanticLabel="${semanticLabel ?? ''}" '
+              'enabled="${enabled ?? ''}" semanticLabel="${_escapeXmlAttribute(semanticLabel)}" '
               'input="${isEditable ? 'true' : 'false'}" '
               'centerX="${((topLeft.dx + bottomRight.dx) / 2).toInt()}" '
               'centerY="${((topLeft.dy + bottomRight.dy) / 2).toInt()}">\n';
-        } catch (e, stackTrace) {
+        } catch (e) {
+          // layoutTreeの同種のcatchブロックと同じ理由(スタックトレース出力のコスト自体が
+          // getPageSource()をハングさせる)で、メッセージのみ出力する。
           debugPrint(
-            '[appium_handler] visitorTree failed for widget $valueId ($type): $e\n$stackTrace',
+            '[appium_handler] visitorTree failed for widget $valueId ($type): $e',
           );
           ++_index;
           _source += '<$type id="$valueId" index="$_index" class="$type">\n';
@@ -229,6 +257,37 @@ class AppiumHandler {
       _document = XmlDocument.parse(_source);
       return _document.toString();
     } catch (e, stackTrace) {
+      // 診断用: XmlParserExceptionはbuffer(パース対象だった_source文字列そのもの)と
+      // position(失敗箇所の文字オフセット)を持っている。エスケープ漏れ等で不正なXMLに
+      // なった場合、実際にどんな内容が問題なのかをそのオフセット周辺の実文字列で確認する
+      // ため出力する。実機のsyslog中継には1行あたりの長さ制限があり、1回のdebugPrintに
+      // 前後まとめて出すと肝心の直前部分が切り捨てられることを確認したため、前半・後半を
+      // 別々の短いdebugPrintに分ける。
+      if (e is XmlParserException && e.buffer != null && e.position != null) {
+        final buffer = e.buffer!;
+        final pos = e.position!;
+        final beforeStart = (pos - 80).clamp(0, buffer.length);
+        final afterEnd = (pos + 80).clamp(0, buffer.length);
+        debugPrint(
+          '[appium_handler] XmlParserException before pos $pos: '
+          '${buffer.substring(beforeStart, pos.clamp(0, buffer.length))}',
+        );
+        debugPrint(
+          '[appium_handler] XmlParserException after pos $pos: '
+          '${buffer.substring(pos.clamp(0, buffer.length), afterEnd)}',
+        );
+        // 診断用: syslog中継での表示が化ける/壊れる文字がある場合に備え、position直前・直後の
+        // 文字について、見た目の文字ではなくcode unit(整数値)をそのまま出す。
+        final codeStart = (pos - 5).clamp(0, buffer.length);
+        final codeEnd = (pos + 5).clamp(0, buffer.length);
+        final codeUnits = [
+          for (var i = codeStart; i < codeEnd; i++) buffer.codeUnitAt(i),
+        ];
+        debugPrint(
+          '[appium_handler] XmlParserException codeUnits[$codeStart..$codeEnd) around pos $pos: '
+          '$codeUnits',
+        );
+      }
       debugPrint('[appium_handler] _getPageSource failed: $e\n$stackTrace');
       rethrow;
     }
