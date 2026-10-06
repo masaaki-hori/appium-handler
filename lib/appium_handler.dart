@@ -563,8 +563,8 @@ class AppiumHandler {
         foundBy = 'bySemanticsLabel';
         value = semanticLabel;
       }
-      final key = node.getAttribute('key');
-      if (key != null && key.isNotEmpty && key != 'null') {
+      final key = _valueKeyString(node.getAttribute('key'));
+      if (key != null) {
         foundBy = 'byValueKey';
         value = key;
       }
@@ -651,8 +651,8 @@ class AppiumHandler {
         'value': semanticLabel,
       });
     }
-    final key = node.getAttribute('key');
-    if (key != null && key.isNotEmpty && key != 'null') {
+    final key = _valueKeyString(node.getAttribute('key'));
+    if (key != null) {
       return jsonEncode({...result, 'foundBy': 'byValueKey', 'value': key});
     }
     final text = result['text'];
@@ -971,6 +971,28 @@ class AppiumHandler {
       return {'isError': false, 'foundBy': locator.foundBy, 'value': locator.value};
     }
 
+    // Replaying a `byText` tap on a label that sits *under* an overlaid tap target (a child-less
+    // InkWell over its content, see `_tapTargetTextFor`): flutter_driver waits for the text itself
+    // to become hit-testable before tapping, which never happens while the overlay covers it. Tap
+    // the text's on-screen center directly instead - that is exactly where a user's finger would
+    // land, and it reaches the overlaying tap target.
+    if (command == 'tap' && foundBy == 'byText' && value != null) {
+      final matches = ft.find.text(value);
+      final elements = matches.evaluate().toList();
+      if (elements.length == 1 && matches.hitTestable().evaluate().isEmpty) {
+        final renderObject = elements.single.renderObject;
+        if (renderObject is RenderBox && renderObject.hasSize && renderObject.attached) {
+          final center = renderObject.localToGlobal(renderObject.size.center(Offset.zero));
+          final result = await _driveByCoordinate(command, center.dx.round(), center.dy.round());
+          if (result != null && result['isError'] != true) {
+            result['foundBy'] = 'byText';
+            result['value'] = value;
+          }
+          return result;
+        }
+      }
+    }
+
     // Replaying a `byText` locator whose text isn't on [node] itself (a tap target's label found in
     // the live tree - see `_findNodeByLocator`/`_tapTargetTextFor`): [node] is only the nearest
     // page-source ancestor, possibly much bigger than the target (e.g. a whole bottom navigation
@@ -1116,8 +1138,8 @@ class AppiumHandler {
     if (foundBy == 'byValueKey') {
       return (foundBy: 'byValueKey', value: value!);
     }
-    final key = node.getAttribute('key');
-    if (key != null && key.isNotEmpty && key != 'null') {
+    final key = _valueKeyString(node.getAttribute('key'));
+    if (key != null) {
       return (foundBy: 'byValueKey', value: key);
     }
     // Before 'byText' on purpose: a text field's 'text' attribute is whatever was typed into it
@@ -1223,8 +1245,8 @@ class AppiumHandler {
         dy: dy,
       );
     }
-    final key = node.getAttribute('key');
-    if (key != null && key.isNotEmpty && key != 'null') {
+    final key = _valueKeyString(node.getAttribute('key'));
+    if (key != null) {
       return _driveKey(
         command,
         key,
@@ -1345,11 +1367,23 @@ class AppiumHandler {
     return indexes;
   }
 
-  /// Whether a page-source `key` attribute value is a usable locator - not empty, not the
-  /// literal "null" an absent key serializes to, and not a Profile/Release build's
-  /// "[<optimized out>]" placeholder.
-  static bool _isUsableKey(String? key) =>
-      key != null && key.isNotEmpty && key != 'null' && !key.contains('optimized out');
+  /// The string inside a page-source `key` attribute when that key is a `ValueKey<String>`
+  /// (`toString()` = `[<'value'>]`), else null. Only such keys are usable as a `byValueKey`
+  /// locator: a `GlobalKey`/`UniqueKey`/`ObjectKey` prints an identity hash (`[GlobalKey#8cb82]`)
+  /// that changes on every app launch, so a recording of it can never be replayed (and
+  /// `find.byKey(const Key(...))` can't match it at all); flutter_driver's `ByValueKey` and the
+  /// generated Dart code both expect the plain string. Also null for an absent key (the literal
+  /// "null") and for Profile/Release's "[<optimized out>]" placeholder.
+  static String? _valueKeyString(String? keyAttribute) {
+    if (keyAttribute == null) {
+      return null;
+    }
+    final match = RegExp(r"^\[<'(.*)'>\]$").firstMatch(keyAttribute);
+    final value = match?.group(1);
+    return (value == null || value.isEmpty) ? null : value;
+  }
+
+  static bool _isUsableKey(String? key) => _valueKeyString(key) != null;
 
   /// Widget types whose node can be left out of a Profile/Release page source when it has no
   /// identifying attribute and exactly the same bounds as its only child: private (`_`-prefixed,
@@ -1424,7 +1458,9 @@ class AppiumHandler {
   /// text only if it contains exactly one distinct text and that text is unique on screen
   /// (`find.text`, the same finder flutter_driver's `ByText` and generated `find.text(...)` use).
   /// Returns null otherwise (no gesture ancestor nearby, no/several texts, or an ambiguous text),
-  /// so the caller falls back to `Type#N`.
+  /// so the caller falls back to `Type#N`. When the tap target itself contains no text (a
+  /// child-less InkWell overlaid on its content), the text drawn inside the target's area is used
+  /// instead - see the overlay case below.
   String? _tapTargetTextFor(XmlNode node) {
     final element = _elementOfNode(node);
     if (element == null) {
@@ -1451,8 +1487,18 @@ class AppiumHandler {
     if (target == null) {
       return null;
     }
+    Rect? globalRectOf(Element e) {
+      final renderObject = e.renderObject;
+      if (renderObject is! RenderBox || !renderObject.hasSize || !renderObject.attached) {
+        return null;
+      }
+      return renderObject.localToGlobal(Offset.zero) & renderObject.size;
+    }
+
     final texts = <String>{};
-    void collect(Element e) {
+    // [within]: only count texts whose on-screen center lies inside this rect (used for the
+    // overlay case below); null counts every text in the subtree.
+    void collect(Element e, Rect? within) {
       if (texts.length > 1) {
         return;
       }
@@ -1468,12 +1514,31 @@ class AppiumHandler {
         value = widget.text.toPlainText();
       }
       if (value != null && value.trim().isNotEmpty) {
-        texts.add(value);
+        final rect = within == null ? null : globalRectOf(e);
+        if (within == null || (rect != null && within.inflate(1).contains(rect.center))) {
+          texts.add(value);
+        }
       }
-      e.visitChildren(collect);
+      e.visitChildren((child) => collect(child, within));
     }
 
-    collect(target!);
+    collect(target!, null);
+    if (texts.isEmpty) {
+      // A common pattern puts a child-less InkWell on top of the content it makes tappable
+      // (`Stack[content, Positioned.fill(InkWell)]`), so the label is the tap target's sibling,
+      // not its descendant. Walk up for text drawn *inside the tap target's area* - a tap at that
+      // text's position lands on the overlaying tap target. The area check (not the depth) is what
+      // keeps this from picking up unrelated text, so the walk can go up far enough to clear the
+      // many elements a `Material` wrapper inserts between the InkWell and the shared parent.
+      final targetRect = globalRectOf(target!);
+      if (targetRect != null) {
+        var levels = 0;
+        target!.visitAncestorElements((ancestor) {
+          collect(ancestor, targetRect);
+          return texts.isEmpty && ++levels < 30;
+        });
+      }
+    }
     if (texts.length != 1) {
       return null;
     }
@@ -1839,7 +1904,10 @@ class AppiumHandler {
   /// as the literal text "null", not an empty attribute - see `visitorTree` above) as well as
   /// the usual empty-string case.
   bool _hasIdentifyingAttribute(XmlNode node) {
-    for (final name in const ['tooltip', 'semanticLabel', 'key', 'text']) {
+    if (_isUsableKey(node.getAttribute('key'))) {
+      return true;
+    }
+    for (final name in const ['tooltip', 'semanticLabel', 'text']) {
       final value = node.getAttribute(name);
       if (value != null && value.isNotEmpty && value != 'null') {
         return true;
@@ -2097,8 +2165,10 @@ class AppiumHandler {
           }
           break;
         case 'byValueKey':
+          // The plain ValueKey string (what is recorded now), or the raw `[<'...'>]` attribute
+          // older recordings carried.
           final key = node.getAttribute('key');
-          if (key == value && key != 'null') {
+          if (key != null && key != 'null' && (_valueKeyString(key) == value || key == value)) {
             return node;
           }
           break;

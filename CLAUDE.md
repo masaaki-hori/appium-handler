@@ -35,7 +35,7 @@ void main() {
 
 These strings and formats are never validated at either end, so a mismatch fails silently. Grep the other two repos for the same literal before renaming anything.
 
-- **`foundBy` values**: `byTooltip`, `bySemanticsLabel`, `byValueKey`, `byFieldLabel` (value `<Type>|<label>`), `byText`, `byType` (value `<Type>` or `<Type>#<N>`) — matched by `dart-common.js#getFlutterFinderExpression`.
+- **`foundBy` values**: `byTooltip`, `bySemanticsLabel`, `byValueKey` (value = the plain string of a `ValueKey<String>`), `byFieldLabel` (value `<Type>|<label>`), `byText`, `byType` (value `<Type>` or `<Type>#<N>`) — matched by `dart-common.js#getFlutterFinderExpression`.
 - **`performActions` action types**: W3C `pointerMove`/`pointerDown`/`pointerUp`/`pause`, plus `tap`, `tapDirect`, `checkExistence`, `enterText`, `checkText`, with optional `elementId` (a page-source `id`) and/or `foundBy`/`value` (replay without coordinates). Matched by the Inspector's `SCREENSHOT_INTERACTION_MODE`/`actions/SessionInspector.js`.
 - **Response** (`_actionResult`): `{text, elementId, type, foundBy, value, submitted}`; `submitted: true` after `enter_text` sent `done` (the Inspector emits a matching `TextInputAction.done` step).
 - **Page-source attributes**: `bounds="[x1,y1][x2,y2]"` (parsed by the Inspector's `element-hit-testing.js`), `typeIndex` (see below), `label`/`hint` on `TextField`/`TextFormField`, and diagnostics on the root `<tree>`: `offstageFilter`, `hiddenElements`, `skippedNodes`, `unresolvedNodes`, `collapsedNodes`.
@@ -58,7 +58,8 @@ These strings and formats are never validated at either end, so a mismatch fails
 **Recording and driving**
 - Actions are driven by page-source id (`ById`) first; the reported locator is computed separately by `_computeRecordableLocator`: tooltip → semantics label → value key → field label → text → tap-target label → `Type#N`.
 - `Type#N`'s N is the **live, finder-order** index (`_computeLiveTypeIndex`, emitted as `typeIndex`) — the same N as `find.byType(Type).at(N)`. Don't count same-typed page-source nodes instead. Callers that send `Type#N` themselves should read `typeIndex`.
-- `byFieldLabel` (`_fieldLabelLocatorFor`) and the tap-target label (`_tapTargetTextFor`) are only recorded when unique on screen; otherwise fall back to `Type#N`. A replayed `byText` that isn't on the resolved node is driven with flutter_driver's `ByText`, not by the node's id.
+- `byValueKey` is recorded only for a `ValueKey<String>`, as its plain string (`_valueKeyString`). Never record the key attribute verbatim: a `GlobalKey`/`UniqueKey`/`ObjectKey` prints an identity hash that changes on every launch, and `[<'x'>]` isn't what `find.byKey(const Key('x'))` matches. Replay also accepts the older raw `[<'x'>]` form.
+- `byFieldLabel` (`_fieldLabelLocatorFor`) and the tap-target label (`_tapTargetTextFor`) are only recorded when unique on screen; otherwise fall back to `Type#N`. The tap-target label also covers a child-less InkWell laid over its content (`Stack[content, Positioned.fill(InkWell)]`): text drawn inside the tap target's area counts. A replayed `byText` that isn't on the resolved node is driven with flutter_driver's `ByText`, and one whose text is covered by an overlay (not hit-testable) is tapped at the text's center — flutter_driver would otherwise wait forever for it to become hit-testable.
 - The `ById` finder needs the `AppiumWidgetInspectorService` that minted the id, which is why it lives in the `_inspectorService` field.
 - All finder-based driver calls go through `_callDriverExtension` (frame sync off while animations tick, 2 s `_driverCallTimeout`) — calling `_driverExtension.call` directly can hang forever on an animated screen.
 

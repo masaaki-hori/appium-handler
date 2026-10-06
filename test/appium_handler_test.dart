@@ -284,6 +284,112 @@ void main() {
       expect(tapped, 1);
     });
 
+    Widget keyedButtons(void Function(String) onTap) => MaterialApp(
+          theme: ThemeData(useMaterial3: false),
+          home: Scaffold(
+            body: Column(children: [
+              InkWell(
+                key: GlobalKey(),
+                onTap: () => onTap('global'),
+                child: const SizedBox(width: 40, height: 40),
+              ),
+              InkWell(
+                key: const ValueKey('mine'),
+                onTap: () => onTap('value'),
+                child: const SizedBox(width: 40, height: 40),
+              ),
+            ]),
+          ),
+        );
+
+    testWidgets('a GlobalKey is never recorded as byValueKey; a ValueKey<String> is, unwrapped',
+        (tester) async {
+      await tester.pumpWidget(keyedButtons((_) {}));
+      final handler = AppiumHandler()..buildDriverExtension();
+
+      final global = await performAction(
+        tester,
+        handler,
+        {'type': 'checkExistence'},
+        at: tester.getCenter(find.byType(InkWell).at(0)),
+      );
+      expect(global['foundBy'], isNot('byValueKey'));
+
+      final value = await performAction(
+        tester,
+        handler,
+        {'type': 'checkExistence'},
+        at: tester.getCenter(find.byKey(const ValueKey('mine'))),
+      );
+      expect(value['foundBy'], 'byValueKey');
+      expect(value['value'], 'mine');
+    });
+
+    testWidgets('a recorded ValueKey replays, also in the older raw [<...>] form', (tester) async {
+      final tapped = <String>[];
+      await tester.pumpWidget(keyedButtons(tapped.add));
+      final handler = AppiumHandler()..buildDriverExtension();
+
+      for (final recorded in ['mine', "[<'mine'>]"]) {
+        final tap = await performAction(
+          tester,
+          handler,
+          {'type': 'tap', 'foundBy': 'byValueKey', 'value': recorded},
+        );
+        await tester.pump();
+        expect(tap['foundBy'], 'byValueKey', reason: recorded);
+      }
+      expect(tapped, ['value', 'value']);
+    });
+
+    // A child-less InkWell laid over its content (`Stack[content, Positioned.fill(InkWell)]`):
+    // the label is the tap target's sibling, not its descendant.
+    Widget overlayButton(VoidCallback onTap) => MaterialApp(
+          theme: ThemeData(useMaterial3: false),
+          home: Scaffold(
+            body: Center(
+              child: Stack(children: [
+                const SizedBox(
+                  width: 60,
+                  height: 60,
+                  child: Column(children: [Icon(Icons.menu), Text('Menu')]),
+                ),
+                Positioned.fill(
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(onTap: onTap),
+                  ),
+                ),
+              ]),
+            ),
+          ),
+        );
+
+    testWidgets('an overlaid InkWell is recorded by the text drawn inside it, and replays',
+        (tester) async {
+      var taps = 0;
+      await tester.pumpWidget(overlayButton(() => taps++));
+      final handler = AppiumHandler()..buildDriverExtension();
+
+      final recorded = await performAction(
+        tester,
+        handler,
+        {'type': 'checkExistence'},
+        at: tester.getCenter(find.byIcon(Icons.menu)),
+      );
+      expect(recorded['foundBy'], 'byText');
+      expect(recorded['value'], 'Menu');
+
+      final tap = await performAction(
+        tester,
+        handler,
+        {'type': 'tap', 'foundBy': 'byText', 'value': 'Menu'},
+      );
+      await tester.pump();
+      expect(tap['foundBy'], 'byText');
+      expect(taps, 1);
+    });
+
     testWidgets('typeIndex in a lazily built list matches the finder; off-screen items have none',
         (tester) async {
       await tester.pumpWidget(MaterialApp(
