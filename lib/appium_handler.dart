@@ -139,6 +139,20 @@ class AppiumHandler {
   // not shared/static across instances.
   AppiumWidgetInspectorService? _inspectorService;
 
+  /// When true, every coordinate hit test (`_hitTestNodeFromOffset`) logs its hit-test path and
+  /// which page-source node it resolved to (up to ~20 lines per tap). Off by default since it's
+  /// very noisy; it was the instrumentation that pinned down a coordinate tap on the Home AppBar's
+  /// メニュー button being delivered to the bottom navigation bar instead (see the app under test's E2E
+  /// `tapHomeMenuButtonDirect`) - set it right after constructing the handler to investigate a
+  /// similar misdelivery again, and filter device logs by the `[appium_handler][hitTest]` prefix.
+  bool verboseHitTestLogging = false;
+
+  void _logHitTest(String message) {
+    if (verboseHitTestLogging) {
+      debugPrint(message);
+    }
+  }
+
   /// Tests only: forces the Profile/Release-only page-source pruning on (or off) regardless of
   /// whether widget creation is tracked (it always is under `flutter test`).
   @visibleForTesting
@@ -1068,12 +1082,6 @@ class AppiumHandler {
       params['text'] = enterText!;
     }
     final result = await _callDriverExtension(params);
-    // [一時デバッグ] enter_textコマンド自体の実行結果を確認するための出力(調査用、後で削除)。
-    if (command == 'enter_text') {
-      debugPrint(
-        '[DEBUG_HOLDER_NAME] _driveById enter_text id=$id text="$enterText" result=$result',
-      );
-    }
     if (command == 'enter_text' && result != null && result['isError'] != true) {
       await _submitTextEntry();
       result['submitted'] = true;
@@ -1906,7 +1914,7 @@ class AppiumHandler {
         renderObjectToNode[renderObject] = node;
       }
     }
-    debugPrint(
+    _logHitTest(
       '[appium_handler][hitTest] pos=$pos viewId=$viewId pathLength=${result.path.length} '
       'documentNodes=$totalNodes toObjectFailures=$toObjectFailures mapped=${renderObjectToNode.length}',
     );
@@ -1916,21 +1924,21 @@ class AppiumHandler {
       final target = entry.target;
       final node = target is RenderObject ? renderObjectToNode[target] : null;
       if (i < 20) {
-        debugPrint(
+        _logHitTest(
           '[appium_handler][hitTest]   path[$i] target=${target.runtimeType} '
           'matched=${node != null ? '${node.getAttribute('class')}#${node.getAttribute('id')}' : 'no'}',
         );
       }
       i++;
       if (node != null) {
-        debugPrint(
+        _logHitTest(
           '[appium_handler][hitTest] => RESOLVED at path[$i-1]: '
           '${node.getAttribute('class')} id=${node.getAttribute('id')} bounds=${node.getAttribute('bounds')}',
         );
         return node;
       }
     }
-    debugPrint('[appium_handler][hitTest] => NO MATCH in ${result.path.length} path entries');
+    _logHitTest('[appium_handler][hitTest] => NO MATCH in ${result.path.length} path entries');
     return null;
   }
 

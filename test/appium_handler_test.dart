@@ -284,6 +284,51 @@ void main() {
       expect(tapped, 1);
     });
 
+    testWidgets('typeIndex in a lazily built list matches the finder; off-screen items have none',
+        (tester) async {
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          // Default cache extent: items just outside the viewport are built (so they're in the
+          // element tree and the page source) but not visible to the finder (skipOffstage).
+          body: ListView(
+            children: [
+              for (var i = 0; i < 30; i++)
+                SizedBox(
+                  height: 80,
+                  child: TextFormField(key: ValueKey('field-$i')),
+                ),
+            ],
+          ),
+        ),
+      ));
+      // Scroll a bit so the first visible field isn't field-0 either (items scrolled past the top
+      // are also off-screen to the finder).
+      await tester.drag(find.byType(ListView), const Offset(0, -400));
+      await tester.pumpAndSettle();
+
+      final source = await AppiumHandler().appiumHandler('getPageSource');
+      final fields = XmlDocument.parse(source)
+          .descendantElements
+          .where((e) => e.getAttribute('class') == 'TextFormField')
+          .toList();
+      final visibleCount = find.byType(TextFormField).evaluate().length;
+      final indexed = fields.where((e) => (e.getAttribute('typeIndex') ?? '').isNotEmpty).toList();
+
+      expect(indexed, hasLength(visibleCount));
+      // The page source still has fields the finder doesn't see (scrolled past / not yet visible),
+      // otherwise this test wouldn't cover the off-screen case below at all.
+      expect(fields.length, greaterThan(visibleCount));
+      for (final field in indexed) {
+        final n = int.parse(field.getAttribute('typeIndex')!);
+        final key = (tester.widget(find.byType(TextFormField).at(n)).key! as ValueKey<String>).value;
+        expect(field.getAttribute('key'), contains(key));
+      }
+      // Any field still in the page source but not visible to the finder carries no typeIndex.
+      for (final field in fields.where((e) => !indexed.contains(e))) {
+        expect(field.getAttribute('typeIndex'), '');
+      }
+    });
+
     testWidgets('pruning keeps identifying nodes and the types callers search for', (tester) async {
       await tester.pumpWidget(MaterialApp(
         home: Scaffold(
