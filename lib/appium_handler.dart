@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter_test/flutter_test.dart' as ft;
 import 'package:xml/xml.dart';
 
 import 'appium_handler_extension.dart';
@@ -25,6 +26,87 @@ String _escapeXmlAttribute(String? value) {
       .replaceAll('&', '&amp;')
       .replaceAll('<', '&lt;')
       .replaceAll('>', '&gt;');
+}
+
+// 画面として完全に隠れている(=どの finder からも見えない)部分木に属する Element をすべて集める。
+// Navigator は上に不透明な route が積まれても下の route を Element ツリーに残す(Overlay の
+// `_Theater` が skipCount より前の entry を offstage として保持する)ため、これを除外しないと
+// ページソースに前の画面のウィジェットが全部残り、次の不整合を起こしていた:
+// - `_typeIndexOf` は前の画面の同型ウィジェットも数えるが、実際に操作する `ByTypeIndexFinder`
+//   (`find.byElementPredicate`、既定で `skipOffstage: true`)は数えないため、`Type#N` が別の
+//   ウィジェットを指す
+// - `byText` 等が前の画面の同じテキストにも一致し、一意にならない
+// 判定には finder と同じ `Element.debugVisitOnstageChildren` を使う(assert ガードではないので
+// Profile/Release でも動く)。ただし対象は「画面単位で隠す」親(Overlay の `_Theater`、`Offstage`、
+// `IndexedStack` の非選択の子、`SliverOffstage`)に限る。Sliver/Viewport の
+// debugVisitOnstageChildren はスクロールで画面外に出たリスト項目も除くが、それまで消すと
+// 呼び出し側が「画面外の欄を見つけてスクロールする」ことができなくなるため対象外とする。
+// `_Theater`/`_RawIndexedStack` は private クラスなので runtimeType 名で判定している
+// (`--obfuscate` ビルドでは一致しなくなり、除外されないだけで従来どおりの出力になる)。
+Set<Element> _collectScreenHiddenElements(Element root) {
+  final hidden = <Element>{};
+
+  bool hidesOffstageChildren(Element element) {
+    final widget = element.widget;
+    if (widget is Offstage || widget is SliverOffstage) {
+      return true;
+    }
+    final name = widget.runtimeType.toString();
+    return name == '_Theater' || name == '_RawIndexedStack';
+  }
+
+  void markHidden(Element element) {
+    hidden.add(element);
+    element.visitChildren(markHidden);
+  }
+
+  void walk(Element element) {
+    if (!hidesOffstageChildren(element)) {
+      element.visitChildren(walk);
+      return;
+    }
+    final onstage = <Element>{};
+    element.debugVisitOnstageChildren(onstage.add);
+    element.visitChildren((child) {
+      if (onstage.contains(child)) {
+        walk(child);
+      } else {
+        markHidden(child);
+      }
+    });
+  }
+
+  walk(root);
+  return hidden;
+}
+
+// 入力欄(TextField/TextFormField)の InputDecoration に設定された labelText/hintText を返す。
+// Key も semanticLabel も無い欄を番号(Type#N)ではなく、欄自身の文言で特定できるようにするため。
+// 描画された Text ではなく、ウィジェットの設定値を読む: ラベル/ヒントの Text は framework 内部
+// (InputDecorator)で作られるので、Debug ビルドの summary tree には出てこない(Profile の全ツリー
+// にだけ出る)。また hintText は入力すると画面から消えるが、設定値は残る。TextFormField は内部で
+// TextField を作り、decoration は TextField 側にしか公開されていないので、自分自身または子孫の
+// 最初の TextField を探す。
+({String? label, String? hint}) _inputDecorationTexts(Object? object) {
+  if (object is! Element) {
+    return (label: null, hint: null);
+  }
+  TextField? textField;
+  void find(Element element) {
+    if (textField != null) {
+      return;
+    }
+    final widget = element.widget;
+    if (widget is TextField) {
+      textField = widget;
+      return;
+    }
+    element.visitChildren(find);
+  }
+
+  find(object);
+  final decoration = textField?.decoration;
+  return (label: decoration?.labelText, hint: decoration?.hintText);
 }
 
 /// Callback handler for the appium-flutter-driver `flutter:requestData` command, used to make
@@ -56,6 +138,15 @@ class AppiumHandler {
   // `_idToReferenceData` (the id registry `toObject` reads) is an instance field of the mixin,
   // not shared/static across instances.
   AppiumWidgetInspectorService? _inspectorService;
+
+  /// Tests only: forces the Profile/Release-only page-source pruning on (or off) regardless of
+  /// whether widget creation is tracked (it always is under `flutter test`).
+  @visibleForTesting
+  bool? debugForcePruneWrappers;
+
+  // The live (finder-order) same-type index of every onstage Element, refreshed on each
+  // `getPageSource` - see `_computeLiveTypeIndex`.
+  Map<Element, int> _liveTypeIndex = {};
 
   void buildDriverExtension() {
     _driverExtension = AppiumHandlerDriverExtension(
@@ -106,6 +197,79 @@ class AppiumHandler {
       _inspectorService = AppiumWidgetInspectorService();
       final tree = _inspectorService!;
 
+      // 画面として隠れている部分木(前の route、非選択のタブ等。_collectScreenHiddenElements 参照)。
+      // 判定自体が失敗した場合は、ページソース取得全体を失敗させるより、従来どおり除外なしで
+      // 出力するほうを選ぶ。
+      // 除外の結果は、logcat/syslog を取らなくても失敗時の XML ダンプだけで確認できるよう、
+      // ルートの <tree> 要素の属性(offstageFilter/hiddenElements/skippedNodes)にも出す。
+      var screenHidden = <Element>{};
+      var filterStatus = 'ok';
+      try {
+        final rootElement = WidgetsBinding.instance.rootElement;
+        if (rootElement != null) {
+          screenHidden = _collectScreenHiddenElements(rootElement);
+        } else {
+          filterStatus = 'no root element';
+        }
+      } catch (e) {
+        filterStatus = 'failed: $e';
+        debugPrint('[appium_handler] collecting offstage elements failed, not filtering: $e');
+      }
+
+      // ページソースのノードが、画面として隠れている部分木に属するか。属する場合は子孫も
+      // すべて属するので、呼び出し側はそのノード以下を丸ごと飛ばしてよい。
+      var skippedNodes = 0;
+      var unresolvedNodes = 0;
+      bool isScreenHidden(String? valueId) {
+        if (valueId == null || screenHidden.isEmpty) {
+          return false;
+        }
+        try {
+          // ignore: invalid_use_of_protected_member
+          final object = tree.toObject(valueId);
+          if (object is! Element) {
+            unresolvedNodes++;
+            return false;
+          }
+          if (screenHidden.contains(object)) {
+            skippedNodes++;
+            return true;
+          }
+          return false;
+        } catch (_) {
+          unresolvedNodes++;
+          return false;
+        }
+      }
+
+      // 各 Element の「同じ型の中での番号」を、ByTypeIndexFinder(find.byElementPredicate(...).at(N)、
+      // skipOffstage: true)が数えるのと同じ順番・同じ範囲で求めておく(_liveTypeIndexOf 参照)。
+      // ページソース上での並び順で数えると、ページソースに出ない要素(Debug の summary tree では
+      // フレームワーク内部で作られた Container/InkWell 等)の分だけ再生時の番号とずれ、Debug と
+      // Profile(全ツリー)でも番号が変わってしまう。
+      _liveTypeIndex = _computeLiveTypeIndex();
+
+      // Profile/Release ではウィジェットの作成場所が記録されないため、summary tree のフィルタが
+      // 効かず、フレームワーク内部のウィジェットまで全部出てくる(2026-10-05 の試算で、ある画面の
+      // 1 つの route だけで 1596 ノード)。表示を見やすくするため、手がかりの無い「構造だけの包み」と
+      // サイズ 0 の葉を出力しない(_isCollapsibleWrapper 参照)。Debug(作成場所が記録される)では
+      // 従来どおり何も省かない。
+      final pruneWrappers = debugForcePruneWrappers ?? !tree.isWidgetCreationTracked();
+      var collapsedNodes = 0;
+
+      Element? elementOf(String? valueId) {
+        if (valueId == null) {
+          return null;
+        }
+        try {
+          // ignore: invalid_use_of_protected_member
+          final object = tree.toObject(valueId);
+          return object is Element ? object : null;
+        } catch (_) {
+          return null;
+        }
+      }
+
       // Computes and caches this node's bounds in `_treeItemOffsets`. Failures here are
       // per-widget (e.g. a widget with no RenderBox/layout data yet) - logged and skipped
       // rather than aborting the whole tree, so one problematic widget doesn't take down
@@ -113,6 +277,9 @@ class AppiumHandler {
       // even if this node's own bounds lookup failed.
       void layoutTree(Map<String, dynamic>? element) {
         final valueId = element?['valueId'];
+        if (isScreenHidden(valueId)) {
+          return;
+        }
         try {
           // subtreeDepth: 0 - only this node's own size/parentData is read below; its children
           // are covered by this same function's own recursion, not by this call's descendants.
@@ -164,6 +331,9 @@ class AppiumHandler {
       // stays well-formed and the rest of the tree (siblings, children) is unaffected.
       void visitorTree(Map<String, dynamic>? element) {
         final valueId = element?['valueId'];
+        if (isScreenHidden(valueId)) {
+          return;
+        }
         var type = 'Unknown';
         try {
           final String runtimeType = element?['widgetRuntimeType'];
@@ -208,6 +378,19 @@ class AppiumHandler {
 
           final isEditable =
               runtimeType == 'TextField' || runtimeType == 'TextFormField';
+          var inputTextsAttributes = '';
+          if (isEditable) {
+            ({String? label, String? hint}) texts = (label: null, hint: null);
+            try {
+              // ignore: invalid_use_of_protected_member
+              texts = _inputDecorationTexts(tree.toObject(valueId));
+            } catch (_) {
+              // 読めなくても欄自体は出力する(属性が空になるだけ)。
+            }
+            inputTextsAttributes =
+                'label="${_escapeXmlAttribute(texts.label?.replaceAll('"', ''))}" '
+                'hint="${_escapeXmlAttribute(texts.hint?.replaceAll('"', ''))}" ';
+          }
 
           var topLeft = const Offset(0.0, 0.0);
           var bottomRight = const Offset(0.0, 0.0);
@@ -217,14 +400,44 @@ class AppiumHandler {
             bottomRight = listOffset[1];
           }
 
+          final children = ((element?['hasChildren'] as bool?) ?? false)
+              ? (element?['children'] as List<dynamic>)
+              : const <dynamic>[];
+          final hasIdentity = isEditable ||
+              (text?.isNotEmpty ?? false) ||
+              (toolTip?.isNotEmpty ?? false) ||
+              (semanticLabel?.isNotEmpty ?? false) ||
+              _isUsableKey(key);
+          if (pruneWrappers && !hasIdentity) {
+            final isZeroSizeLeaf = children.isEmpty &&
+                (bottomRight.dx - topLeft.dx <= 0 || bottomRight.dy - topLeft.dy <= 0);
+            final onlyChildBounds = children.length == 1
+                ? _treeItemOffsets[(children.first as Map<String, dynamic>?)?['valueId']]
+                : null;
+            final isPassThrough = onlyChildBounds != null &&
+                onlyChildBounds[0] == topLeft &&
+                onlyChildBounds[1] == bottomRight &&
+                _isCollapsibleWrapper(runtimeType);
+            if (isZeroSizeLeaf || isPassThrough) {
+              collapsedNodes++;
+              for (final child in children) {
+                visitorTree(child);
+              }
+              return;
+            }
+          }
+
+          final typeIndex = _liveTypeIndex[elementOf(valueId)];
           ++_index;
           _source +=
               '<$type id="$valueId" key="${_escapeXmlAttribute(key)}" index="$_index" class="$type" '
+              'typeIndex="${typeIndex ?? ''}" '
               'text="${_escapeXmlAttribute(text)}" tooltip="${_escapeXmlAttribute(toolTip)}" '
               'bounds="[${topLeft.dx.toInt()},${topLeft.dy.toInt()}]'
               '[${bottomRight.dx.toInt()},${bottomRight.dy.toInt()}]" '
               'enabled="${enabled ?? ''}" semanticLabel="${_escapeXmlAttribute(semanticLabel)}" '
               'input="${isEditable ? 'true' : 'false'}" '
+              '$inputTextsAttributes'
               'centerX="${((topLeft.dx + bottomRight.dx) / 2).toInt()}" '
               'centerY="${((topLeft.dy + bottomRight.dy) / 2).toInt()}">\n';
         } catch (e) {
@@ -246,13 +459,21 @@ class AppiumHandler {
         _source += '</$type>\n';
       }
 
-      _source = '<?xml version="1.0"?>\n<tree>\n';
+      _source = '';
       final result = tree.getRootWidgetSummaryTreeWithPreviews({
         'groupName': 'tree_1',
       });
       layoutTree(result['result'] as Map<String, dynamic>?);
+      // layoutTree と visitorTree の両方で同じノードを判定するので、visitorTree の分だけ数える。
+      skippedNodes = 0;
+      unresolvedNodes = 0;
+      collapsedNodes = 0;
       visitorTree(result['result'] as Map<String, dynamic>?);
-      _source += '</tree>\n';
+      _source = '<?xml version="1.0"?>\n'
+          '<tree offstageFilter="${_escapeXmlAttribute(filterStatus.replaceAll('"', "'"))}" '
+          'hiddenElements="${screenHidden.length}" skippedNodes="$skippedNodes" '
+          'unresolvedNodes="$unresolvedNodes" collapsedNodes="$collapsedNodes">\n'
+          '$_source</tree>\n';
 
       _document = XmlDocument.parse(_source);
       return _document.toString();
@@ -736,6 +957,28 @@ class AppiumHandler {
       return {'isError': false, 'foundBy': locator.foundBy, 'value': locator.value};
     }
 
+    // Replaying a `byText` locator whose text isn't on [node] itself (a tap target's label found in
+    // the live tree - see `_findNodeByLocator`/`_tapTargetTextFor`): [node] is only the nearest
+    // page-source ancestor, possibly much bigger than the target (e.g. a whole bottom navigation
+    // bar), so acting on it by id would hit the wrong spot. Drive the text itself instead.
+    if (foundBy == 'byText' && value != null && node.getAttribute('text') != value) {
+      final result = await _driveFinder(
+        command,
+        'ByText',
+        'text',
+        value,
+        enterText: enterText,
+        duration: duration,
+        dx: dx,
+        dy: dy,
+      );
+      if (result != null && result['isError'] != true) {
+        result['foundBy'] = 'byText';
+        result['value'] = value;
+      }
+      return result;
+    }
+
     // Resolving by the widget's own page-source id is unambiguous by construction, unlike
     // tooltip/semanticsLabel/key/text/type below (any of which can be missing, or match more
     // than one widget) - so it's tried first for actually performing the action. It's not usable
@@ -869,12 +1112,28 @@ class AppiumHandler {
     if (key != null && key.isNotEmpty && key != 'null') {
       return (foundBy: 'byValueKey', value: key);
     }
+    // Before 'byText' on purpose: a text field's 'text' attribute is whatever was typed into it
+    // (its controller's content), which makes a poor locator, and before 'byType' because
+    // 'Type#N' shifts whenever a field is added/removed/reordered on the same screen.
+    if (foundBy == 'byFieldLabel') {
+      return (foundBy: 'byFieldLabel', value: value!);
+    }
+    final fieldLabel = _fieldLabelLocatorFor(node);
+    if (fieldLabel != null) {
+      return (foundBy: 'byFieldLabel', value: fieldLabel);
+    }
     if (foundBy == 'byText') {
       return (foundBy: 'byText', value: value!);
     }
     final text = await _findNodeText(node);
     if (text != null && text.isNotEmpty) {
       return (foundBy: 'byText', value: text);
+    }
+    if (foundBy != 'byType') {
+      final targetText = _tapTargetTextFor(node);
+      if (targetText != null) {
+        return (foundBy: 'byText', value: targetText);
+      }
     }
     final type = foundBy == 'byType' ? value! : node.getAttribute('class')!;
     final index = _typeIndexOf(node, type);
@@ -1051,10 +1310,216 @@ class AppiumHandler {
     return _driveByCoordinate(command, x, y, dx: dx, dy: dy);
   }
 
+  /// Each onstage Element's 0-based position among onstage Elements of the same runtime type, in
+  /// exactly the order `ByTypeIndexFinder` (`find.byElementPredicate(...).at(N)`) enumerates them
+  /// (`collectAllElementsFrom(rootElement, skipOffstage: true)`, the finders' own candidate list).
+  /// Counting in the *live* tree rather than in the page source makes a recorded `Type#N` mean the
+  /// same widget at replay and in generated Dart (`find.byType(Type).at(N)`), whatever the page
+  /// source happens to include - Debug's summary tree leaves out framework-created widgets, while
+  /// Profile/Release's full tree doesn't.
+  Map<Element, int> _computeLiveTypeIndex() {
+    final indexes = <Element, int>{};
+    final root = WidgetsBinding.instance.rootElement;
+    if (root == null) {
+      return indexes;
+    }
+    final counts = <String, int>{};
+    try {
+      for (final element in ft.collectAllElementsFrom(root, skipOffstage: true)) {
+        final type = element.widget.runtimeType.toString();
+        final index = counts[type] ?? 0;
+        indexes[element] = index;
+        counts[type] = index + 1;
+      }
+    } catch (e) {
+      debugPrint('[appium_handler] computing live type indexes failed: $e');
+    }
+    return indexes;
+  }
+
+  /// Whether a page-source `key` attribute value is a usable locator - not empty, not the
+  /// literal "null" an absent key serializes to, and not a Profile/Release build's
+  /// "[<optimized out>]" placeholder.
+  static bool _isUsableKey(String? key) =>
+      key != null && key.isNotEmpty && key != 'null' && !key.contains('optimized out');
+
+  /// Widget types whose node can be left out of a Profile/Release page source when it has no
+  /// identifying attribute and exactly the same bounds as its only child: private (`_`-prefixed,
+  /// framework-internal) types and well-known structural framework widgets. Deliberately does
+  /// not include types callers search for by tag (e.g. the app under test's E2E helpers look for `Text`,
+  /// `Icon`, `InkWell`, `TextFormField`, `Container`, `Padding` and app widgets like `AppIcon`).
+  static bool _isCollapsibleWrapper(String runtimeType) {
+    final base = runtimeType.split('<').first;
+    return base.startsWith('_') || _structuralWrapperTypes.contains(base);
+  }
+
+  static const _structuralWrapperTypes = {
+    'Semantics', 'Listener', 'ConstrainedBox', 'RawGestureDetector', 'DefaultTextStyle',
+    'MouseRegion', 'Actions', 'Focus', 'FocusScope', 'FocusTraversalGroup', 'Shortcuts',
+    'KeyedSubtree', 'RepaintBoundary', 'IgnorePointer', 'AbsorbPointer', 'Builder',
+    'StatefulBuilder', 'LayoutBuilder', 'MediaQuery', 'Theme', 'AnimatedTheme', 'IconTheme',
+    'DefaultSelectionStyle', 'Directionality', 'NotificationListener', 'Material',
+    'AnimatedDefaultTextStyle', 'AnimatedPhysicalModel', 'PhysicalModel', 'PhysicalShape',
+    'CustomPaint', 'ClipRect', 'ClipRRect', 'ClipPath', 'Align', 'Center', 'SizedBox',
+    'LimitedBox', 'Offstage', 'TickerMode', 'Visibility', 'Opacity', 'FadeTransition',
+    'SlideTransition', 'AnimatedBuilder', 'ListenableBuilder', 'ValueListenableBuilder',
+    'UnmanagedRestorationScope', 'RestorationScope', 'HeroControllerScope', 'TextFieldTapRegion',
+    'TapRegion', 'ScrollConfiguration', 'ScrollNotificationObserver', 'PrimaryScrollController',
+    'GlowingOverscrollIndicator', 'StretchingOverscrollIndicator', 'CompositedTransformTarget',
+    'CompositedTransformFollower', 'DecoratedBox', 'ColoredBox', 'Transform',
+    'FractionalTranslation', 'AnimatedSize', 'AnimatedOpacity',
+  };
+
+  /// The live Element a page-source node stands for (via its `id`), if still resolvable.
+  Element? _elementOfNode(XmlNode node) {
+    final id = node.getAttribute('id');
+    if (id == null || id.isEmpty) {
+      return null;
+    }
+    try {
+      // ignore: invalid_use_of_protected_member
+      final object = _inspectorService?.toObject(id);
+      return object is Element ? object : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// The page-source node for [element], or for its nearest ancestor that has one (an element can
+  /// be missing from the page source - e.g. a framework-created `Text` in Debug's summary tree).
+  XmlNode? _nodeForElementOrAncestor(Element element) {
+    final nodesByElement = <Element, XmlNode>{};
+    for (final node in _document?.descendants ?? const <XmlNode>[]) {
+      final nodeElement = _elementOfNode(node);
+      if (nodeElement != null) {
+        nodesByElement[nodeElement] = node;
+      }
+    }
+    final own = nodesByElement[element];
+    if (own != null) {
+      return own;
+    }
+    XmlNode? found;
+    element.visitAncestorElements((ancestor) {
+      found = nodesByElement[ancestor];
+      return found == null;
+    });
+    return found;
+  }
+
+  /// A `byText` locator for a node with no identifying attribute of its own (e.g. a
+  /// BottomNavigationBar item's icon, a button's decoration container), taken from the label of
+  /// the tap target it belongs to. Walks up the *live* tree (framework widgets included - the label
+  /// `Text` of a stock BottomNavigationBar item, AppBar or button is created by the framework, so
+  /// it isn't in a Debug build's page source at all) to the nearest gesture-handling ancestor
+  /// (`InkResponse`/`InkWell`, `GestureDetector`, `RawGestureDetector`), and uses that target's
+  /// text only if it contains exactly one distinct text and that text is unique on screen
+  /// (`find.text`, the same finder flutter_driver's `ByText` and generated `find.text(...)` use).
+  /// Returns null otherwise (no gesture ancestor nearby, no/several texts, or an ambiguous text),
+  /// so the caller falls back to `Type#N`.
+  String? _tapTargetTextFor(XmlNode node) {
+    final element = _elementOfNode(node);
+    if (element == null) {
+      return null;
+    }
+    Element? target;
+    var depth = 0;
+    bool isTapTarget(Element e) {
+      final widget = e.widget;
+      return widget is InkResponse || widget is GestureDetector || widget is RawGestureDetector;
+    }
+
+    if (isTapTarget(element)) {
+      target = element;
+    } else {
+      element.visitAncestorElements((ancestor) {
+        if (isTapTarget(ancestor)) {
+          target = ancestor;
+          return false;
+        }
+        return ++depth < 15;
+      });
+    }
+    if (target == null) {
+      return null;
+    }
+    final texts = <String>{};
+    void collect(Element e) {
+      if (texts.length > 1) {
+        return;
+      }
+      final widget = e.widget;
+      // An Icon draws its glyph as a RichText of the icon font's code point - not a label.
+      if (widget is Icon || widget is ImageIcon) {
+        return;
+      }
+      String? value;
+      if (widget is Text) {
+        value = widget.data ?? widget.textSpan?.toPlainText();
+      } else if (widget is RichText) {
+        value = widget.text.toPlainText();
+      }
+      if (value != null && value.trim().isNotEmpty) {
+        texts.add(value);
+      }
+      e.visitChildren(collect);
+    }
+
+    collect(target!);
+    if (texts.length != 1) {
+      return null;
+    }
+    final text = texts.single;
+    if (text.contains('|') || ft.find.text(text).evaluate().length != 1) {
+      return null;
+    }
+    return text;
+  }
+
+  /// Text-field nodes of class [type] in the current page source whose `label` or `hint`
+  /// attribute (the field's `InputDecoration.labelText`/`hintText`, see `_inputDecorationTexts`)
+  /// equals [label].
+  List<XmlNode> _fieldsWithLabel(String type, String label) => [
+        for (final candidate in _document?.descendants ?? const <XmlNode>[])
+          if (candidate.getAttribute('class') == type &&
+              (candidate.getAttribute('label') == label || candidate.getAttribute('hint') == label))
+            candidate,
+      ];
+
+  /// A `byFieldLabel` locator value (`'<Type>|<label>'`) for a key-less text field, identifying it
+  /// by its own label/hint wording - generated code turns it into
+  /// `find.widgetWithText(<Type>, '<label>')` (appium-inspector's `dart-common.js`), and replay
+  /// resolves it via `_findNodeByLocator`. Only returned when exactly one field on the current
+  /// screen carries that wording, so the recorded locator is never ambiguous; otherwise the caller
+  /// falls back to `Type#N`.
+  String? _fieldLabelLocatorFor(XmlNode node) {
+    final type = node.getAttribute('class');
+    if (type != 'TextField' && type != 'TextFormField') {
+      return null;
+    }
+    for (final attribute in const ['label', 'hint']) {
+      final label = node.getAttribute(attribute);
+      if (label == null || label.isEmpty || label.contains('|')) {
+        continue;
+      }
+      if (_fieldsWithLabel(type!, label).length == 1) {
+        return '$type|$label';
+      }
+    }
+    return null;
+  }
+
   /// The 0-based position of [node] among all `_document` nodes sharing its `class` attribute, in
   /// document order - the same order `find.byElementPredicate` (which `ByType`/`ByTypeIndex` are
   /// both built on) visits elements in, so it lines up with `Finder.at(index)`.
   int? _typeIndexOf(XmlNode node, String type) {
+    // The live, finder-order index (see `_computeLiveTypeIndex`), when the page source carries it.
+    if (node.getAttribute('class') == type) {
+      final live = int.tryParse(node.getAttribute('typeIndex') ?? '');
+      if (live != null) {
+        return live;
+      }
+    }
     var index = 0;
     for (final candidate in _document?.descendants ?? const <XmlNode>[]) {
       if (candidate.getAttribute('class') != type) {
@@ -1563,6 +2028,18 @@ class AppiumHandler {
     if (foundBy == null || value == null || value.isEmpty) {
       return null;
     }
+    if (foundBy == 'byFieldLabel') {
+      // 'value' is '<Type>|<label>' (see '_fieldLabelLocatorFor').
+      final separator = value.indexOf('|');
+      if (separator <= 0) {
+        return null;
+      }
+      final matches = _fieldsWithLabel(
+        value.substring(0, separator),
+        value.substring(separator + 1),
+      );
+      return matches.isEmpty ? null : matches.first;
+    }
     if (foundBy == 'byType') {
       // 'value' may be a bare type name, or 'Type#index' (see '_typeIndexOf') when a plain type
       // match was ambiguous at recording time (more than one node shared the type) and got
@@ -1572,6 +2049,22 @@ class AppiumHandler {
       final parts = value.split('#');
       final type = parts[0];
       final index = parts.length > 1 ? int.tryParse(parts[1]) : null;
+      // 'index' is the live, finder-order index (`typeIndex` attribute, see
+      // `_computeLiveTypeIndex`) whenever the page source carries one - only page sources from an
+      // older handler fall back to counting same-typed page-source nodes below.
+      final hasTypeIndex = _document?.descendants.any(
+            (candidate) => (candidate.getAttribute('typeIndex') ?? '').isNotEmpty,
+          ) ??
+          false;
+      if (index != null && hasTypeIndex) {
+        for (final candidate in _document?.descendants ?? const <XmlNode>[]) {
+          if (candidate.getAttribute('class') == type &&
+              candidate.getAttribute('typeIndex') == '$index') {
+            return candidate;
+          }
+        }
+        return null;
+      }
       var count = 0;
       for (final candidate in _document?.descendants ?? const <XmlNode>[]) {
         if (candidate.getAttribute('class') != type) {
@@ -1607,6 +2100,16 @@ class AppiumHandler {
             return node;
           }
           break;
+      }
+    }
+    if (foundBy == 'byText') {
+      // A tap target's label recorded by `_tapTargetTextFor` is often a framework-created Text that
+      // the page source doesn't contain (Debug's summary tree). Resolve it in the live tree; the
+      // returned node is that Text's nearest page-source ancestor, only used to locate the action -
+      // `_execCommandWithFinder` then drives it with flutter_driver's `ByText` itself (see there).
+      final matches = ft.find.text(value).evaluate();
+      if (matches.length == 1) {
+        return _nodeForElementOrAncestor(matches.single);
       }
     }
     return null;
