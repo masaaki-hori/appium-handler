@@ -231,7 +231,7 @@ void main() {
       expect(index, greaterThan(0));
     });
 
-    // useMaterial3: false like the app under test itself - Material 3's InkSparkle splash loads a shader
+    // useMaterial3: false (as in the real app this was found with) - Material 3's InkSparkle splash loads a shader
     // asset that fails to decode when the test build cache was produced by a different SDK.
     Widget bottomNavApp(void Function(int) onTap) => MaterialApp(
           theme: ThemeData(useMaterial3: false),
@@ -410,15 +410,15 @@ void main() {
       }
     });
 
-    // Mirrors the app under test's setup, where on-device dumps still contained every previous route at
+    // Mirrors a real app's setup, where on-device dumps still contained every previous route at
     // x = -width/3 (the Cupertino transition's parallax end position): Cupertino transitions on
     // Android too, a `MaterialApp.builder` Stack, a home pushed via `PageRouteBuilder`, two
     // `MaterialPageRoute` pushes on top, and a non-opaque `OverlayEntry` (like a coach mark).
-    testWidgets('the app under test-like navigation: previous routes are not included', (tester) async {
+    testWidgets('real-app-like navigation: previous routes are not included', (tester) async {
       final navigatorKey = GlobalKey<NavigatorState>();
       await tester.pumpWidget(MaterialApp(
         navigatorKey: navigatorKey,
-        // the app under test sets `CupertinoPageTransitionsBuilder` for every platform; the iOS platform's
+        // The real app sets `CupertinoPageTransitionsBuilder` for every platform; the iOS platform's
         // default transitions are the same, without naming a class whose exporting library
         // differs between Flutter 3.38 (material) and 3.44 (cupertino).
         theme: ThemeData(useMaterial3: false, platform: TargetPlatform.iOS),

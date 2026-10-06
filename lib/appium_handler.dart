@@ -141,9 +141,9 @@ class AppiumHandler {
 
   /// When true, every coordinate hit test (`_hitTestNodeFromOffset`) logs its hit-test path and
   /// which page-source node it resolved to (up to ~20 lines per tap). Off by default since it's
-  /// very noisy; it was the instrumentation that pinned down a coordinate tap on the Home AppBar's
-  /// メニュー button being delivered to the bottom navigation bar instead (see the app under test's E2E
-  /// `tapHomeMenuButtonDirect`) - set it right after constructing the handler to investigate a
+  /// very noisy; it was the instrumentation that pinned down a coordinate tap on an AppBar
+  /// button being delivered to a bottom navigation bar tab instead - set it right after
+  /// constructing the handler to investigate a
   /// similar misdelivery again, and filter device logs by the `[appium_handler][hitTest]` prefix.
   bool verboseHitTestLogging = false;
 
@@ -1354,8 +1354,8 @@ class AppiumHandler {
   /// Widget types whose node can be left out of a Profile/Release page source when it has no
   /// identifying attribute and exactly the same bounds as its only child: private (`_`-prefixed,
   /// framework-internal) types and well-known structural framework widgets. Deliberately does
-  /// not include types callers search for by tag (e.g. the app under test's E2E helpers look for `Text`,
-  /// `Icon`, `InkWell`, `TextFormField`, `Container`, `Padding` and app widgets like `AppIcon`).
+  /// not include types callers search for by tag (E2E helpers commonly look for `Text`, `Icon`,
+  /// `InkWell`, `TextFormField`, `Container`, `Padding` and the app's own widgets).
   static bool _isCollapsibleWrapper(String runtimeType) {
     final base = runtimeType.split('<').first;
     return base.startsWith('_') || _structuralWrapperTypes.contains(base);
@@ -1866,9 +1866,8 @@ class AppiumHandler {
   /// overlapping bounds could fool: two unrelated widgets from different (visible vs. offstage)
   /// screens can share identical bounds, and document order alone can't tell which one is
   /// actually on top - confirmed on-device via a StackTrace-instrumented debug build, where a
-  /// coordinate tap aimed at the Home AppBar's メニュー button was instead delivered to the
-  /// bottom-nav's 別の tab, several document-positions away but coincidentally
-  /// overlapping at that point (see a real app's E2E suite). A real hit
+  /// coordinate tap aimed at an AppBar button was instead delivered to a bottom navigation bar
+  /// tab, several document-positions away but coincidentally overlapping at that point. A real hit
   /// test can't make that mistake, since it walks the actual render tree instead of guessing from
   /// a flattened list.
   XmlNode? _hitTestNodeFromOffset(Offset pos) {
