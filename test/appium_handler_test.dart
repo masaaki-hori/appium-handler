@@ -597,4 +597,55 @@ void main() {
       expect(source, isNot(contains('hidden text')));
     });
   });
+
+  group('page-source text of rich text', () {
+    testWidgets('an app-built RichText and a Text.rich carry their plain text', (tester) async {
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: Column(children: [
+            RichText(
+              key: const ValueKey('rich'),
+              text: const TextSpan(
+                style: TextStyle(color: Colors.black),
+                children: [TextSpan(text: '2026年10月15日 15時32分'), TextSpan(text: 'の予約変更依頼です')],
+              ),
+            ),
+            const Text.rich(TextSpan(text: '取消', children: [TextSpan(text: '申請中')]),
+                key: ValueKey('text-rich')),
+            const Text('plain', key: ValueKey('plain')),
+          ]),
+        ),
+      ));
+
+      final doc = XmlDocument.parse(await AppiumHandler().appiumHandler('getPageSource'));
+      String textOf(String key) => doc.descendantElements
+          .firstWhere((e) => e.getAttribute('key')?.contains(key) ?? false)
+          .getAttribute('text')!;
+
+      expect(textOf("'rich'"), '2026年10月15日 15時32分の予約変更依頼です');
+      expect(textOf("'text-rich'"), '取消申請中');
+      expect(textOf("'plain'"), 'plain');
+    });
+
+    testWidgets('a RichText built by a Text or an Icon is not given text', (tester) async {
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: Column(children: [
+            const Text('once', key: ValueKey('t')),
+            const Icon(Icons.person, key: ValueKey('i')),
+            RichText(key: const ValueKey('r'), text: const TextSpan(text: 'mine')),
+          ]),
+        ),
+      ));
+
+      Element richTextUnder(String key) => tester.element(
+          find.descendant(of: find.byKey(ValueKey(key)), matching: find.byType(RichText)));
+
+      // A Profile/Release full tree lists the Text's internal RichText too - it must not repeat
+      // the Text's string.
+      expect(spanTextOf(richTextUnder('t')), isNull);
+      expect(spanTextOf(richTextUnder('i')), isNull);
+      expect(spanTextOf(tester.element(find.byKey(const ValueKey('r')))), 'mine');
+    });
+  });
 }

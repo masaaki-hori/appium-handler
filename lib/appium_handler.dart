@@ -87,6 +87,44 @@ Set<Element> _collectScreenHiddenElements(Element root) {
 // にだけ出る)。また hintText は入力すると画面から消えるが、設定値は残る。TextFormField は内部で
 // TextField を作り、decoration は TextField 側にしか公開されていないので、自分自身または子孫の
 // 最初の TextField を探す。
+/// Plain text of a `Text.rich` or an app-built `RichText`, whose text is an `InlineSpan` rather
+/// than the `data` property the page source otherwise reads (so it came out empty). Skips a
+/// `RichText` built by a `Text` (that `Text` already carries the text - a Profile/Release full tree
+/// would list it twice) and an icon glyph (an `Icon` draws its code point as a `RichText`).
+@visibleForTesting
+String? spanTextOf(Object? object) {
+  if (object is! Element) {
+    return null;
+  }
+  final widget = object.widget;
+  InlineSpan? span;
+  if (widget is Text) {
+    span = widget.textSpan;
+  } else if (widget is RichText) {
+    var builtByTextOrIcon = false;
+    var depth = 0;
+    object.visitAncestorElements((ancestor) {
+      if (ancestor.widget is Text || ancestor.widget is Icon) {
+        builtByTextOrIcon = true;
+        return false;
+      }
+      return ++depth < 4;
+    });
+    if (builtByTextOrIcon) {
+      return null;
+    }
+    span = widget.text;
+  }
+  final value = span?.toPlainText(includeSemanticsLabels: false);
+  if (value == null || value.trim().isEmpty) {
+    return null;
+  }
+  if (value.runes.every((rune) => rune >= 0xE000 && rune <= 0xF8FF)) {
+    return null;
+  }
+  return value;
+}
+
 ({String? label, String? hint}) _inputDecorationTexts(Object? object) {
   if (object is! Element) {
     return (label: null, hint: null);
@@ -387,6 +425,15 @@ class AppiumHandler {
                 if (start > 0 && end > 0) {
                   text = txt.substring(start + 1, end);
                 }
+            }
+          }
+
+          if (text == null || text.isEmpty) {
+            try {
+              // ignore: invalid_use_of_protected_member
+              text = spanTextOf(tree.toObject(valueId))?.replaceAll('"', '');
+            } catch (_) {
+              // keep the empty text
             }
           }
 

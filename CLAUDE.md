@@ -54,6 +54,7 @@ These strings and formats are never validated at either end, so a mismatch fails
 - Subtrees hidden at the screen level (routes covered by an opaque route, `Offstage(offstage: true)`, unselected `IndexedStack` children, `SliverOffstage`) are left out (`_collectScreenHiddenElements`). List items scrolled out of view are kept but have an empty `typeIndex`.
 - In Profile/Release only, identity-less pass-through wrappers and zero-size identity-less leaves are dropped (`_isCollapsibleWrapper`; `debugForcePruneWrappers` forces it in tests). Never drop types callers search for by tag (`Text`, `Icon`, `InkWell`, `TextFormField`, `Container`, `Padding`, app widgets).
 - `label`/`hint` are the field's `InputDecoration.labelText`/`hintText` (`_inputDecorationTexts`), not rendered text.
+- `text` is a `Text`'s `data`; for a `Text.rich` or an app-built `RichText` it is the span's plain text (`spanTextOf`). A `RichText` built by a `Text` or an `Icon` gets none, so a full tree doesn't repeat the string or list icon glyphs.
 
 **Recording and driving**
 - Actions are driven by page-source id (`ById`) first; the reported locator is computed separately by `_computeRecordableLocator`: tooltip → semantics label → value key → field label → text → tap-target label → `Type#N`.
