@@ -65,7 +65,7 @@ These strings and formats are never validated at either end, so a mismatch fails
 - All finder-based driver calls go through `_callDriverExtension` (frame sync off while animations tick, 2 s `_driverCallTimeout`) — calling `_driverExtension.call` directly can hang forever on an animated screen.
 
 **`enter_text`**
-- flutter_driver's `EnterText` ignores the finder and types into the focused field: always focus via `_focusForTextEntry`, which **registers text-entry emulation before tapping** (the other order silently drops the text).
+- flutter_driver's `EnterText` ignores the finder and types into the focused field: always focus via `_focusForTextEntry`, which **drops any current focus, then registers text-entry emulation, then taps** (registering after the tap, or tapping a field that already has focus, silently drops the text).
 - After entering text, `_submitTextEntry` sends `done` and the response carries `submitted: true`.
 - If the id-based attempt fails, return the failure — don't fall through to the type chain (it can type into the wrong field while reporting success).
 

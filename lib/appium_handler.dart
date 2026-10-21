@@ -1829,9 +1829,19 @@ class AppiumHandler {
   /// 報告され、実際にはフォーカスが確立していないため入力したテキストが行き場を失って
   /// 破棄される(呼び出し側からは検知できない)という問題があった。呼び出し側で結果を見て
   /// enter_text全体を失敗として扱えるよう、この戻り値を返すようにする。
+  ///
+  /// If a text field already has focus (e.g. the user or an earlier tap focused it), tapping it
+  /// again doesn't re-attach its input connection, so no `setClient` call happens after the
+  /// emulation is registered and the text is dropped while `enter_text` still reports success.
+  /// Drop the current focus first (and let a frame run so the connection is closed), so the tap
+  /// always attaches a fresh connection that the emulation captures.
   Future<Map<String, dynamic>?> _focusForTextEntry(
     Map<String, String> finderParams,
   ) async {
+    if (FocusManager.instance.primaryFocus != null) {
+      FocusManager.instance.primaryFocus!.unfocus();
+      await WidgetsBinding.instance.endOfFrame;
+    }
     await _callDriverExtension({'command': 'set_text_entry_emulation', 'enabled': 'true'});
     return _callDriverExtension({...finderParams, 'command': 'tap'});
   }
