@@ -20,6 +20,37 @@ void main() {
     expect(decoded['height'], isA<int>());
   });
 
+  testWidgets('a coordinate action survives widgets unmounted since the last page source',
+      (tester) async {
+    // A Column: only a RenderObjectElement throws on `renderObject` once unmounted.
+    await tester.pumpWidget(const MaterialApp(
+      home: Scaffold(body: Column(children: [Text('old screen')])),
+    ));
+    final handler = AppiumHandler()..buildDriverExtension();
+    await handler.appiumHandler('getPageSource');
+
+    // The page source's ids now include unmounted elements, as during a route transition.
+    await tester.pumpWidget(const SizedBox.shrink());
+
+    final actions = [
+      {
+        'type': 'pointer',
+        'id': 'finger1',
+        'actions': [
+          {'type': 'pointerMove', 'x': 10, 'y': 10},
+          {'type': 'pointerDown'},
+          {'type': 'pointerUp'},
+        ],
+      },
+    ];
+    final response = await tester.runAsync(
+      () => handler
+          .appiumHandler('performActions:${jsonEncode(actions)}')
+          .timeout(const Duration(seconds: 10)),
+    );
+    expect(response, isNotNull);
+  });
+
   group('getPageSource exposes input decoration texts on text fields', () {
     XmlElement fieldWithKey(String source, String key) => XmlDocument.parse(source)
         .descendantElements

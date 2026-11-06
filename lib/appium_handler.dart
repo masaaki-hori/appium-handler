@@ -2079,7 +2079,9 @@ class AppiumHandler {
         toObjectFailures++;
         continue;
       }
-      final renderObject = object is Element ? object.renderObject : null;
+      // `_document` can be older than the tree: an element unmounted since (e.g. by a route
+      // transition) throws on `renderObject`, which would fail the whole action.
+      final renderObject = object is Element && object.mounted ? object.renderObject : null;
       if (renderObject != null) {
         // When several page-source nodes resolve to the same RenderObject (e.g. a `Semantics`
         // wrapper and the plain widget it wraps), the later - deeper, per document order - one
