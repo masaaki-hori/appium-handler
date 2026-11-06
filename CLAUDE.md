@@ -64,6 +64,9 @@ These strings and formats are never validated at either end, so a mismatch fails
 - The `ById` finder needs the `AppiumWidgetInspectorService` that minted the id, which is why it lives in the `_inspectorService` field.
 - All finder-based driver calls go through `_callDriverExtension` (frame sync off while animations tick, 2 s `_driverCallTimeout`) — calling `_driverExtension.call` directly can hang forever on an animated screen.
 
+**Material widgets in another package**
+- Since Flutter 3.47 an app may import Material from the `material_ui` package, whose `InkWell`/`InkResponse`/`TextField` are different classes with the same names. Don't check them with `is` alone: use `isMaterialWidget` (class or type name) and read their properties through `dynamic` (`_onTapOf`, `_inputDecorationTexts`). Don't add `material_ui` as a dependency (older SDKs can't resolve it). `test/material_ui_widgets_test.dart` covers this with same-named stand-ins.
+
 **`enter_text`**
 - flutter_driver's `EnterText` ignores the finder and types into the focused field: always focus via `_focusForTextEntry`, which **drops any current focus, then registers text-entry emulation, then taps** (registering after the tap, or tapping a field that already has focus, silently drops the text).
 - After entering text, `_submitTextEntry` sends `done` and the response carries `submitted: true`.

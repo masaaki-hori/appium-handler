@@ -47,6 +47,10 @@ Timing instrumentation showed `_getPageSource()` itself was not the bottleneck (
 - **No fallback after an id-based failure.** The chain's `ByType` step for `enter_text` taps a plain, non-indexed type to focus, which with several text fields on screen can type into the wrong one while reporting success (seen on a device after the id-based focus tap timed out because a list virtualized the field away). The id-based failure is returned instead, so the caller re-resolves and retries.
 - **"Enter Text does nothing" was once an Inspector bug.** The Inspector read the hover `x`/`y` React state, which is reset to `null` the moment the context-menu overlay steals the pointer, so `performActions` arrived with `{"x":null,"y":null}` and threw before any logging here. The fix reads coordinates from the `contextmenu` event (`rightClickCoordsRef`). Check the actual payload for null coordinates before suspecting this package.
 
+## Material moved out of the SDK (Flutter 3.47)
+
+Flutter 3.47 split Material into the `material_ui` package, and `dart fix --apply --code=migrate_design_widgets` rewrites an app's `package:flutter/material.dart` imports to it. Its `InkWell`, `InkResponse`, `TextField` and `Tooltip` are copies with the same names, not the SDK's classes. On a device, an app migrated this way broke `tapDirect` (`_driveByDirectCallback` found no `InkResponse`, returned an error, and the caller's fallback closed the screen instead of pressing the button) and dropped `label`/`hint` from text fields (`_inputDecorationTexts` found no `TextField`). The tap-target label (`_tapTargetTextFor`) was affected the same way. These checks now also match the type name (`isMaterialWidget`), as flutter_driver's `ByType` does, and read `onTap`/`decoration` through `dynamic`, so the package needs no `material_ui` dependency and still builds on older SDKs.
+
 ## Debugging on a device
 
 - Narrow `adb logcat` grep patterns (a substring of one specific message) once filtered out the very diagnostic prints meant to explain a failure. Grep by the `[appium_handler]` tag prefix.

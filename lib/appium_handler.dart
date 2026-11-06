@@ -129,13 +129,13 @@ String? spanTextOf(Object? object) {
   if (object is! Element) {
     return (label: null, hint: null);
   }
-  TextField? textField;
+  Widget? textField;
   void find(Element element) {
     if (textField != null) {
       return;
     }
     final widget = element.widget;
-    if (widget is TextField) {
+    if (isMaterialWidget(widget, 'TextField')) {
       textField = widget;
       return;
     }
@@ -143,8 +143,62 @@ String? spanTextOf(Object? object) {
   }
 
   find(object);
-  final decoration = textField?.decoration;
-  return (label: decoration?.labelText, hint: decoration?.hintText);
+  final field = textField;
+  if (field == null) {
+    return (label: null, hint: null);
+  }
+  if (field is TextField) {
+    return (label: field.decoration?.labelText, hint: field.decoration?.hintText);
+  }
+  try {
+    final decoration = (field as dynamic).decoration;
+    return (
+      label: decoration?.labelText as String?,
+      hint: decoration?.hintText as String?,
+    );
+  } catch (_) {
+    return (label: null, hint: null);
+  }
+}
+
+/// Whether [widget] is the Material widget [typeName] (`InkWell`, `InkResponse`, `TextField`)
+/// from either `package:flutter/material.dart` or the `material_ui` package. Flutter 3.47 moved
+/// Material into `material_ui`, whose widgets are different classes with the same names, so an
+/// app migrated with `dart fix --code=migrate_design_widgets` fails every `is InkResponse`/
+/// `is TextField` check here. Matched by name instead of depending on `material_ui` (which older
+/// SDKs can't resolve); flutter_driver's `ByType` matches by name too. Their properties are read
+/// through `dynamic`.
+@visibleForTesting
+bool isMaterialWidget(Widget widget, String typeName) {
+  final matchesClass = switch (typeName) {
+    'InkWell' => widget is InkWell,
+    'InkResponse' => widget is InkResponse,
+    'TextField' => widget is TextField,
+    _ => false,
+  };
+  return matchesClass || widget.runtimeType.toString() == typeName;
+}
+
+bool _isInkResponse(Widget widget) =>
+    isMaterialWidget(widget, 'InkResponse') || isMaterialWidget(widget, 'InkWell');
+
+/// `onTap` of an `InkResponse`/`InkWell` (either package, see [isMaterialWidget]) or a
+/// `GestureDetector`, or null.
+VoidCallback? _onTapOf(Widget widget) {
+  if (widget is InkResponse) {
+    return widget.onTap;
+  }
+  if (widget is GestureDetector) {
+    return widget.onTap;
+  }
+  if (_isInkResponse(widget)) {
+    try {
+      return (widget as dynamic).onTap as VoidCallback?;
+    } catch (_) {
+      return null;
+    }
+  }
+  return null;
 }
 
 /// Callback handler for the appium-flutter-driver `flutter:requestData` command, used to make
@@ -955,11 +1009,7 @@ class AppiumHandler {
 
     VoidCallback? onTap;
     bool checkWidget(Widget widget) {
-      if (widget is InkResponse) {
-        onTap = widget.onTap;
-      } else if (widget is GestureDetector) {
-        onTap = widget.onTap;
-      }
+      onTap = _onTapOf(widget);
       return onTap != null;
     }
 
@@ -1517,7 +1567,7 @@ class AppiumHandler {
     var depth = 0;
     bool isTapTarget(Element e) {
       final widget = e.widget;
-      return widget is InkResponse || widget is GestureDetector || widget is RawGestureDetector;
+      return _isInkResponse(widget) || widget is GestureDetector || widget is RawGestureDetector;
     }
 
     if (isTapTarget(element)) {
