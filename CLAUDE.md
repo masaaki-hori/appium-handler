@@ -27,7 +27,7 @@ void main() {
 ## Commands
 
 - `fvm flutter pub get` / `fvm flutter analyze` (should report no issues) / `fvm flutter test`
-- Flutter is pinned in [.fvmrc](.fvmrc) (3.38.9; the `.fvm/version` file is stale — `.fvmrc` is authoritative). Use `fvm flutter ...`, not a bare `flutter`.
+- Flutter is pinned in [.fvmrc](.fvmrc) (3.47.8; the `.fvm/version` file is stale — `.fvmrc` is authoritative). Use `fvm flutter ...`, not a bare `flutter`. `pubspec.yaml` still allows `>=3.38.9`, so also run `fvm spawn 3.38.9 analyze` / `fvm spawn 3.38.9 test` for apps that stay on 3.38.
 - Check another SDK without changing the pin: `fvm spawn <version> analyze` / `fvm spawn <version> test` (no `flutter` word), then `fvm flutter pub get` to restore. Run both the pinned version and the newest one you care about when touching framework internals.
 - `pubspec.yaml` lists only what `lib/` and `test/` import (`flutter`, `flutter_driver`, `flutter_test`, `xml`; `flutter_lints`/`test` as dev deps). Don't add packages "just in case" — a larger dependency list used to break `pub get` on newer SDKs.
 
